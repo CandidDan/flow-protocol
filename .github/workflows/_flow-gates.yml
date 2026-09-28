@@ -1,0 +1,270 @@
+name: _flow-gates (reusable)
+
+# Reusable form of the Definition-of-Done gate. Repos call it from a 3-line caller
+# (project-template/.github/workflows/flow-gates.yml) instead of copying this file —
+# so the gate logic is authored once in canonical (CandidDan/flow) and adopted, never
+# re-copied. See docs/flow-reusable-workflows.md.
+#
+# Enforces the gate on every PR, regardless of stack, by reading the command names from
+# the *caller repo's* .flow/config.yml (checkout pulls the caller's repo, so .flow/ here is
+# the consuming project's store and tooling). The protocol says "no PR without the gate";
+# this makes that true even if an agent (or human) tries to skip it locally.
+
+on:
+  workflow_call:
+    inputs:
+      setup_node_version:
+        description: >
+          If set, runs actions/setup-node with this version before the per-stack gate
+          commands. Defaults to 22 (the coverage flags require >= 22). Pass an empty string
+          for a non-Node stack that provisions its own toolchain inside the config commands;
+          a stack that needs a setup step we don't model should keep a full flow-gates.yml
+          instead of the thin caller (copy-where-reference-won't-reach).
+        required: false
+        type: string
+        default: "22"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0          # need the base commit to diff against
+
+      # The store is main-only: feature branches carry code, never task-state. A branch
+      # that also edited .flow/tasks/ would clobber main's newer state when it merges.
+      # Reject it here so the rule isn't trust-based.
+      #
+      # flow-0008: the guard writes a decision line to $DECISION_LOG on every run, and the step
+      # after it fails the job when that line is absent. Previously this step could no-op — a
+      # bad `base`, an empty diff, a shell that died before the `if` — and exit 0, at which
+      # point "the guard found nothing wrong" and "the guard never ran" were indistinguishable.
+      # Branch names reach the script through `env:`, never through `${{ }}` interpolation.
+      - name: Guard — store is main-only
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          DECISION_LOG: ${{ runner.temp }}/store-guard.log
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "origin/$BASE_BRANCH"...HEAD)"
+          offenders="$(printf '%s\n' "$changed" | grep -E '^\.flow/tasks/' || true)"
+          n="$(printf '%s' "$offenders" | grep -c . || true)"
+          if [ "$n" -gt 0 ]; then reason=store-modified; else reason=clean; fi
+          echo "store-guard: decision=enforced reason=$reason files=$n" | tee "$DECISION_LOG"
+          if [ "$n" -gt 0 ]; then
+            echo "::error::This PR modifies .flow/tasks/. Task state lives on main only —"
+            echo "::error::feature branches carry code, not store changes. Move the state"
+            echo "::error::transition to a commit on main and drop it from this branch."
+            printf '%s\n' "$offenders" | sed 's/^/  offending: /'
+            exit 1
+          fi
+
+      # flow-0008: absence of evidence is not evidence of absence. This step is the whole point
+      # of the decision line — it is what makes a silent guard fail instead of pass.
+      - name: Assert — the store-guard proved it ran
+        if: github.event_name == 'pull_request'
+        env:
+          DECISION_LOG: ${{ runner.temp }}/store-guard.log
+          DECISION_PREFIX: 'store-guard: decision='
+        run: |
+          # Anchored prefix match on a fixed token, never a loose substring: the guards' prose
+          # is free to be reworded, the `<name>: decision=` prefix is a CI contract that is not.
+          if [ ! -s "${DECISION_LOG:-}" ] || ! grep -qE "^${DECISION_PREFIX}" "$DECISION_LOG"; then
+            echo "::error::No '${DECISION_PREFIX}...' line was produced — the guard did not run."
+            echo "::error::Silence is not a pass: a guard that can be quiet and still be reported"
+            echo "::error::as green is a guard-shaped hole. Failing the gate (flow-0008)."
+            exit 1
+          fi
+          grep -E "^${DECISION_PREFIX}" "$DECISION_LOG"
+
+      # Language toolchain. Node by default (the common Flow stack); non-Node callers pass
+      # setup_node_version: "" and provision their toolchain inside the config commands.
+      - name: Set up Node
+        if: inputs.setup_node_version != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.setup_node_version }}
+
+      - name: Read commands from .flow/config.yml
+        id: cfg
+        run: |
+          # Braces matter: without them `a || b && c` runs the chmod even when snap succeeded
+          # (live-validation finding, 2026-06-05).
+          sudo snap install yq 2>/dev/null || { sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq; }
+          {
+            echo "install=$(yq -r '.commands.install' .flow/config.yml)"
+            echo "build=$(yq -r '.commands.build' .flow/config.yml)"
+            echo "lint=$(yq -r '.commands.lint' .flow/config.yml)"
+            echo "test=$(yq -r '.commands.test' .flow/config.yml)"
+            echo "coverage=$(yq -r '.commands.coverage' .flow/config.yml)"
+            echo "covmin=$(yq -r '.coverage_min' .flow/config.yml)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install
+        run: ${{ steps.cfg.outputs.install }}
+
+      - name: Build
+        run: ${{ steps.cfg.outputs.build }}
+
+      - name: Lint
+        run: ${{ steps.cfg.outputs.lint }}
+
+      - name: Test
+        run: ${{ steps.cfg.outputs.test }}
+
+      - name: Coverage (fails under coverage_min)
+        run: ${{ steps.cfg.outputs.coverage }}
+
+      # Optional but recommended: a dependency audit. Wire to the stack's auditor.
+      # - name: Dependency audit
+      #   run: npm audit --audit-level=high   # or pip-audit, etc.
+
+  # The flow tooling is JS regardless of the project's stack, so it's tested on its own —
+  # the foundation's own Definition of Done ("every behaviour has a proving test") applies
+  # to the tooling too. Stays independent of the per-stack gate above.
+  flow-tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Test flow tooling
+        run: node --test .flow/bin/*.test.mjs
+
+      # Drift detection (back-ported from the canary repo's state:check): a validated store beats a
+      # trusted one. Problems fail; warnings (e.g. stale board snapshot) just report.
+      - name: flow-doctor — store consistency
+        run: node .flow/bin/flow-doctor.mjs
+
+  # Scope enforcement: a task-carrying PR's diff must stay within the task's declared `touches`.
+  # Runs in the per-stack gate job (needs the PR diff + base). Mirrors the store-guard.
+  touches:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: touches-guard — diff stays within declared scope
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          # PR title is the id fallback when the platform forces a non-flow/ branch (CAN-52).
+          # Without it this guard silently skipped every cloud-session PR.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_BRANCH: ${{ github.base_ref }}
+          BASE_REF: origin/${{ github.base_ref }}
+          DECISION_LOG: ${{ runner.temp }}/touches-guard.log
+        run: |
+          # pipefail is NOT on by default in `bash -e {0}`. Without it `tee` would swallow the
+          # guard's exit code and out-of-scope drift would pass the gate — the exact fail-open
+          # shape flow-0008 exists to close, reintroduced by the capture that detects it.
+          set -o pipefail
+          git fetch -q origin "$BASE_BRANCH"
+          node .flow/bin/touches-guard.mjs 2>&1 | tee "$DECISION_LOG"
+
+      # flow-0008: identical in body to the store-guard's assertion above — one rule, applied to
+      # both guards. `.flow/bin/gate-assertion.test.mjs` pins that they stay byte-identical and
+      # that this script fails against a guard that produced nothing.
+      - name: Assert — the touches-guard proved it ran
+        env:
+          DECISION_LOG: ${{ runner.temp }}/touches-guard.log
+          DECISION_PREFIX: 'touches-guard: decision='
+        run: |
+          # Anchored prefix match on a fixed token, never a loose substring: the guards' prose
+          # is free to be reworded, the `<name>: decision=` prefix is a CI contract that is not.
+          if [ ! -s "${DECISION_LOG:-}" ] || ! grep -qE "^${DECISION_PREFIX}" "$DECISION_LOG"; then
+            echo "::error::No '${DECISION_PREFIX}...' line was produced — the guard did not run."
+            echo "::error::Silence is not a pass: a guard that can be quiet and still be reported"
+            echo "::error::as green is a guard-shaped hole. Failing the gate (flow-0008)."
+            exit 1
+          fi
+          grep -E "^${DECISION_PREFIX}" "$DECISION_LOG"
+
+  # ── The declared source_roots that the primary gate does NOT already cover (flow-0077) ──
+  #
+  # `source_roots:` in the caller's .flow/config.yml has always named every tree that holds source
+  # and the command that parses it, but until flow-0077 nothing RAN those checks — flow-doctor only
+  # proved each entry existed. A repo with a second runtime therefore dropped out of the thin-caller
+  # model and hand-wrote a job per tree, which (a) duplicated this file, (b) could not be pushed by
+  # a worker credential, since `.github/workflows/` needs Workflows: Write, and (c) was overwritten
+  # by the next flow-sync. Now it is a .flow/config.yml edit, which any worker can push.
+  #
+  # TWO JOBS, not one: a matrix cannot be computed by the job that uses it. `plan` reads the config
+  # and emits the entries that need their own job; `source-root` fans out over them.
+  source-roots-plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      # A caller that bumped its workflow refs without syncing `.flow/bin/` has flow-gates asking
+      # for a helper it does not have. Node would say ERR_MODULE_NOT_FOUND from a path nobody
+      # recognises; this says which file and what to run. flow-0008's rule applies — an absent
+      # helper is a failure, never a quiet skip, because a skipped plan is an ungated tree.
+      - name: Plan — which declared source_roots need a job of their own
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ ! -f .flow/bin/source-roots.mjs ]; then
+            echo "::error::.flow/bin/source-roots.mjs is missing. This reusable needs it to read"
+            echo "::error::source_roots from .flow/config.yml. Run the flow-sync workflow to pick up"
+            echo "::error::the rest of .flow/bin/, then re-run this check."
+            exit 1
+          fi
+          node .flow/bin/source-roots.mjs plan
+
+  # `if` on the count, so a repo with nothing extra to gate gets a SKIPPED job rather than a red
+  # one — an empty matrix is the correct answer for a single-tree repo, and for canonical itself
+  # (all four of its entries are `npm run lint`/`npm run build`, which the gate job above runs).
+  # fail-fast is off: one broken tree must not cancel the others' verdicts.
+  source-root:
+    needs: source-roots-plan
+    if: needs.source-roots-plan.outputs.count != '0'
+    name: source-root (${{ matrix.path }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.source-roots-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Runtime setup, chosen by the entry's `runtime`. `none` gets neither step — the check
+      # provisions its own toolchain, which is how a stack Flow does not model still gets gated.
+      - name: Set up Node
+        if: matrix.runtime == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.version }}
+          cache: ${{ matrix.cache }}
+          cache-dependency-path: ${{ matrix.cache_dependency_path }}
+
+      - name: Set up Deno
+        if: matrix.runtime == 'deno'
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.version }}
+
+      # `path` and `check` come from .flow/config.yml, which a PR can edit. Running a
+      # config-supplied command is not new — the gate job above already runs `commands.*`. What
+      # would be new is `${{ matrix.check }}` inside this `run:`, where Actions pastes the value
+      # into the script BEFORE bash sees it, so a crafted check could break out of the quoting and
+      # run something the config never said. Through `env:` the value is data to the shell, and
+      # the helper hands it to one `spawnSync` with the shell it is supposed to have.
+      - name: Run the declared check
+        env:
+          FLOW_SOURCE_ROOT_PATH: ${{ matrix.path }}
+          FLOW_SOURCE_ROOT_CHECK: ${{ matrix.check }}
+          FLOW_SOURCE_ROOT_RETRY: ${{ matrix.retry }}
+        run: node .flow/bin/source-roots.mjs run
