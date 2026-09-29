@@ -1,0 +1,523 @@
+name: _flow-sync (reusable)
+
+# Reusable form of the Flow infra adopt mechanism (propagation plan, Phase 4). Flow infra is
+# authored in canonical (CandidDan/flow) and repos *adopt* it; this is the "pull canonical in"
+# half of that contract — the complement to flow-doctor's version-drift *warning*. When the
+# calling repo's .flow/VERSION is behind canonical, this copies the updated infra in and opens a
+# REVIEWED PR (Dependabot-style), so the update still clears the gate before it lands. Repos call
+# it from a thin caller (project-template/.github/workflows/flow-sync.yml) that owns the schedule.
+# See docs/flow-reusable-workflows.md.
+#
+# What it syncs (the *copied* surface — everything else is referenced and can't drift):
+#   - .flow/bin/*            the tooling (flow-doctor, touches-guard, pick-task, … and this logic)
+#   - .github/workflows/flow-*.yml   the thin callers (in case canonical added/changed one), EXCEPT
+#                            one that declares a job canonical's template does not: that caller is
+#                            kept whole and reported, never overwritten (flow-0076)
+#   - .flow/PROTOCOL.md      the protocol itself (flow-0048) — identical in every Flow repo, so a
+#                            protocol fix reaches the fleet by sync instead of by hand-patch
+#   - .flow/VERSION          bumped to canonical's stamp
+# It never touches .flow/config.yml, .flow/tasks/, or the project's CLAUDE.md and AGENTS.md — those
+# are intentionally per-repo. The two host files stay a manual adopt because each carries a
+# `## Project notes` section below its pointer at the protocol; auto-rewriting them would destroy
+# repo-specific content. The protocol has no such section, which is why it can be mirrored and they
+# cannot — see the copy step's own comment.
+#
+# Why a PR, not a push: adoption must clear the same Definition-of-Done gate as any change. A
+# flow-sync/<version> branch isn't a flow/<id> branch, so touches-guard skips it and the
+# store-guard (which only blocks .flow/tasks/ edits) passes — yet flow-gates' flow-tooling job
+# runs the *synced* tests + flow-doctor, so the gate validates the update for free.
+#
+# What a re-run does when the branch already exists (flow-0075). `flow-sync/<version>` is stable
+# per version, and this workflow used to read *the branch exists* as *a sync PR is open* — logging
+# that claim without checking it, and exiting 0. A PR closed without merging therefore made its
+# version permanently unofferable. The run now gathers three facts (does the branch exist, is
+# there an OPEN PR from it, and which canonical commit its head records as a `Canonical-SHA:`
+# trailer) and hands them to `flow-sync.mjs existing`, which answers create / rebuild / refresh /
+# noop. rebuild and refresh rebuild the branch from current canonical on current main and push it
+# with --force-with-lease; rebuild then opens a PR, refresh does not, because the open PR picks up
+# the new head by itself. A lookup that FAILS stops the run with an ::error naming it — it never
+# degrades to noop.
+#
+# Opens with FLOW_PAT (CAN-58) so flow-gates fires on the sync PR too. FLOW_PAT is REQUIRED here,
+# not optional: the copied surface includes `.github/workflows/flow-*.yml`, and only a token that
+# carries the `workflows` scope may push a file under that directory. GITHUB_TOKEN never can — see
+# the permissions block below for why that is not fixable with a permission. The thin caller passes
+# it by name, not `secrets: inherit`.
+
+on:
+  workflow_call:
+    inputs:
+      canonical_ref:
+        description: "Canonical ref to adopt from (tag/branch). Match your callers' pin. Default v2."
+        required: false
+        type: string
+    secrets:
+      FLOW_PAT:
+        required: false
+
+permissions:
+  contents: write          # push the sync branch
+  pull-requests: write     # open the sync PR
+  # There is deliberately NO `workflows:` key here, and there cannot be one. GITHUB_TOKEN's
+  # permission set is CLOSED — actions, attestations, checks, contents, deployments, discussions,
+  # id-token, issues, models, packages, pages, pull-requests, repository-projects, security-events,
+  # statuses — and `workflows` is not a member of it. That scope exists only for GitHub Apps and
+  # fine-grained PATs, which is precisely WHY GITHUB_TOKEN may not push a file under
+  # `.github/workflows/`: the permission it would need cannot be granted to it, so the answer was
+  # never going to be found in a permissions block.
+  #
+  # flow-0051 wrote `workflows: write` here anyway. GitHub's parser rejected the entire file —
+  #   failed to parse workflow: (Line: 43, Col: 7): Unexpected value 'workflows'
+  # — so the workflow stopped starting at all, in every repo that had adopted it. The copied
+  # surface still needs that scope; it now comes from the CREDENTIAL instead. `Checkout this repo`
+  # below takes `token: ${{ secrets.FLOW_PAT }}`, so the `git push` is made by a fine-grained PAT
+  # that can carry Workflows: Write, and the `Require FLOW_PAT` step fails loudly up front when
+  # that secret is absent. Absence is not the only way that credential fails, so a second step
+  # probes it for expiry/revocation before anything uses it, and the push translates its own
+  # rejection — see both steps' comments below (flow-0062).
+  #
+  # `.flow/bin/check-workflows.mjs` now fails `npm run build` on any permission key outside the
+  # closed set listed above, so an invented key cannot reach a tag again (flow-0060).
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # Fail HERE, naming the fix, rather than forty lines later at `git push` with GitHub's
+      # opaque "refusing to allow a GitHub App to create or update workflow ... without
+      # `workflows` permission". FLOW_PAT stays `required: false` at the workflow_call boundary on
+      # purpose: flipping it to `required: true` fails at call time with GitHub's own generic
+      # secret-missing message, which says nothing about Workflows: Write — and the whole lesson
+      # of flow-0051 is that the opaque message is what cost the weeks.
+      - name: "Require FLOW_PAT (Workflows: Write)"
+        env:
+          FLOW_PAT: ${{ secrets.FLOW_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FLOW_PAT}" ]; then
+            echo "::error title=FLOW_PAT missing::flow-sync cannot run. It copies canonical's thin callers into .github/workflows/, and GitHub refuses that push from GITHUB_TOKEN: workflows is not one of GITHUB_TOKEN's permissions and cannot be granted to it. Set the FLOW_PAT secret on this repository to a fine-grained PAT with Workflows: Write (plus Contents: Read and write, and Pull requests: Read and write), and forward it from your flow-sync.yml caller."
+            exit 1
+          fi
+          echo "FLOW_PAT is present — the sync push will be made by it, not by GITHUB_TOKEN."
+
+      # PRESENCE IS NOT VALIDITY (flow-0062). The step above proves the secret is SET. An expired
+      # token is set. A revoked one is set. A token without Workflows: Write is set. All three
+      # walked past that guard and died forty lines later at `git push` with GitHub's opaque
+      # rejection — the exact failure the guard's own comment says it exists to prevent.
+      #
+      # Of the two invalidity classes only ONE is detectable up front, and they need different
+      # mechanisms. EXPIRY or REVOCATION is cheap to detect: one authenticated read the token must
+      # be able to make anyway answers 401 when the credential is dead. SCOPE is not detectable at
+      # all — a fine-grained PAT exposes no scope-introspection endpoint, so Workflows: Write can
+      # only be tested by attempting the thing it authorises. That half is handled where it can be
+      # handled, at the push itself; see the translation further down.
+      #
+      # 401 IS THE ONLY FATAL VERDICT. A 5xx, a rate limit, an SSO block, a DNS blip or a proxy
+      # eating the call says nothing whatever about the token, and reporting a transient as an
+      # expired credential would send an operator to rotate a PAT that works — a worse outcome
+      # than the bug this fixes. Everything that is not 401 is inconclusive, warns, and continues.
+      #
+      # It runs BEFORE `Checkout this repo` because that step is FLOW_PAT's first consumer: left to
+      # checkout, a dead token surfaces as git's "Authentication failed", naming neither the secret
+      # nor its expiry.
+      - name: "Probe FLOW_PAT validity (expired or revoked)"
+        env:
+          FLOW_PAT: ${{ secrets.FLOW_PAT }}
+        run: |
+          set -euo pipefail
+          API="${GITHUB_API_URL:-https://api.github.com}"
+          # Exactly one API call, and the cheapest authenticated read there is: the repository the
+          # next step is about to clone with this same token. A healthy sync pays one request.
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+                    -H "Authorization: Bearer ${FLOW_PAT}" \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
+                    "${API}/repos/${GITHUB_REPOSITORY}")" || CODE="000"
+          case "$CODE" in
+            2??)
+              echo "FLOW_PAT authenticated against ${GITHUB_REPOSITORY} (HTTP ${CODE}) — the credential is live."
+              ;;
+            401)
+              echo "::error title=FLOW_PAT rejected as invalid::FLOW_PAT is SET, but GitHub rejected it - an authenticated read of ${GITHUB_REPOSITORY} returned 401. This is NOT the missing-secret case and re-adding the secret will not help; the token itself is expired or has been revoked. Fine-grained PATs expire on a date chosen when they are created, and GitHub does not warn the workflows that use them. The fix is ROTATION - issue a replacement fine-grained PAT with Workflows: Write (plus Contents: Read and write, and Pull requests: Read and write) on this repository, then update this repo's FLOW_PAT secret. Every other repo that adopted Flow with the same token expires with it and needs the same rotation."
+              exit 1
+              ;;
+            *)
+              echo "::warning title=FLOW_PAT validity unverified::The FLOW_PAT validity probe returned HTTP ${CODE}. That is not 401, so it says nothing about the token - a 5xx, a rate limit or a network failure is a transient, and reporting one as an expired credential would send you to rotate a PAT that works. Continuing. If the token really is bad, the push below fails and names it."
+              ;;
+          esac
+
+      - name: Checkout this repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          # THE FIX (flow-0060). checkout persists whatever token it is given as this clone's
+          # remote credential, so this line — not the permissions block — decides who the
+          # `git push` further down authenticates as. Left at its default it is GITHUB_TOKEN, and
+          # a push that creates or modifies `.github/workflows/flow-*.yml` is refused server-side
+          # however the permissions block is written. FLOW_PAT is a fine-grained PAT, so it CAN
+          # carry Workflows: Write, and it is the only credential that makes this push legal.
+          token: ${{ secrets.FLOW_PAT }}
+
+      # THE FIX (flow-0064). This used to be a second `actions/checkout` with
+      # `path: .flow-canonical`, which put canonical's tree INSIDE the working tree of the repo
+      # being synced. `git add -A` further down then staged it, and because that directory carries
+      # its own `.git`, git could not store it as a tree and recorded a GITLINK instead — a
+      # submodule entry with no `.gitmodules` stanza. Both of the first two real sync PRs carried
+      # one, and every job that ran `git submodule foreach` against them ended:
+      #
+      #   fatal: No url found for submodule path '.flow-canonical' in .gitmodules
+      #
+      # Merging such a PR writes that entry into the adopting repo's history permanently, after
+      # which `git clone --recurse-submodules` fails outright for everyone.
+      #
+      # It cannot be fixed by choosing a better `path:`. That input is documented as a relative
+      # path UNDER $GITHUB_WORKSPACE and the action refuses anything outside it, and the checkout
+      # above lands at the workspace root — so with two `actions/checkout` steps the second tree is
+      # always inside the first. A plain clone is not bound by that rule. CandidDan/flow is public,
+      # which is why the step this replaces never needed a token either, so no credential is
+      # involved and none is exposed. An ignore rule was considered and rejected: it would leave a
+      # second full checkout sitting inside the repo, one `git add -f` or one missed pattern away
+      # from the same commit.
+      - name: Clone canonical (outside the working tree)
+        env:
+          CANONICAL_REF: ${{ inputs.canonical_ref || 'v2' }}
+        run: |
+          set -euo pipefail
+          CANON_DIR="${RUNNER_TEMP}/flow-canonical"
+          rm -rf "$CANON_DIR"
+          # A ref beginning with `-` is refused outright rather than defended against per-command.
+          # Raised by flow-0064's security review as Low and not exploitable — `canonical_ref` is a
+          # workflow_call input set by the calling repo's own YAML, never request data — and closed
+          # here because it is one line. The review proposed a `--` separator on each git command
+          # instead; that is right for `git clone` and WRONG for `git checkout`, where `--`
+          # separates revisions from PATHS, so `git checkout -- v2` looks for a file called `v2`
+          # and exits 1 with `pathspec 'v2' did not match any file(s) known to git` — it would have
+          # broken the fallback below. The `--branch` value needs no guard at all: git's option
+          # parser consumes the next argv as the value, so `--branch --upload-pack=x` is read as a
+          # branch named `--upload-pack=x`. The separators kept below are free, not load-bearing.
+          case "$CANONICAL_REF" in
+            -*) echo "::error title=Invalid canonical_ref::canonical_ref '${CANONICAL_REF}' starts with '-'. It names a tag or branch in CandidDan/flow and cannot begin with a dash."; exit 1 ;;
+          esac
+          # --branch takes a tag or a branch, which is what `canonical_ref` is documented to be.
+          # A raw commit SHA is not valid there, and actions/checkout used to accept one, so fall
+          # back to a full clone and an explicit checkout rather than silently dropping support.
+          # git's own stderr is CAPTURED, not discarded, and replayed before the retry. It is
+          # suppressed on the happy path only because a SHA reaching here fails this clone as a
+          # matter of course, and that expected noise would read as a fault. Raised by this PR's
+          # code review as non-blocking; taken anyway, because the message it replaced asserted a
+          # cause ("a commit SHA reaches here") that it had not established — a network failure or
+          # a deleted tag would have been reported as a SHA and sent the next reader the wrong way.
+          # That is flow-0049's defect class, and shipping a new instance of it inside flow-0064
+          # would be the same mistake one layer along.
+          CLONE_ERR="$(mktemp)"
+          if ! git clone --quiet --depth 1 --branch "$CANONICAL_REF" \
+                 -- https://github.com/CandidDan/flow.git "$CANON_DIR" 2>"$CLONE_ERR"; then
+            echo "Shallow clone of '$CANONICAL_REF' failed. git said:"
+            sed 's/^/  /' "$CLONE_ERR"
+            echo "Retrying as a full clone. That succeeds when the ref is a commit SHA, which --branch does not accept; if it fails too, the message above is the real cause."
+            git clone --quiet -- https://github.com/CandidDan/flow.git "$CANON_DIR"
+            # Trailing `--`, never leading: it tells git the argument before it is a REVISION and
+            # not a path. Leading, it would mean the opposite. See the guard above.
+            git -C "$CANON_DIR" checkout --quiet "$CANONICAL_REF" --
+          fi
+          rm -f "$CLONE_ERR"
+          echo "CANON_DIR=${CANON_DIR}" >> "$GITHUB_ENV"
+          # The resolved ref, exported for the same reason CANON_DIR is: the adopt step names it
+          # when canonical@that ref carries no protocol to copy (flow-0048). Exported rather than
+          # re-derived there, so the `|| 'v2'` default has exactly one definition.
+          echo "CANONICAL_REF=${CANONICAL_REF}" >> "$GITHUB_ENV"
+          # The canonical COMMIT, not just the ref (flow-0075). `canonical_ref` is normally a
+          # MOVING branch (`v2`), so two syncs of the same `.flow/VERSION` can be built from
+          # different canonical trees — which is how CandidDan/Nudge ended up with a leftover
+          # `flow-sync/2.0.0` branch built from an older `v2` on an older `main`. The sync commit
+          # records this SHA as a `Canonical-SHA:` trailer and the next run compares against it,
+          # so "the branch exists" stops being mistaken for "the branch is current".
+          CANON_SHA="$(git -C "$CANON_DIR" rev-parse HEAD)"
+          echo "CANON_SHA=${CANON_SHA}" >> "$GITHUB_ENV"
+          echo "Cloned CandidDan/flow@${CANONICAL_REF} (${CANON_SHA}) to ${CANON_DIR} (outside ${GITHUB_WORKSPACE})."
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Adopt canonical infra if behind
+        env:
+          # No `|| github.token` fallback: the `Require FLOW_PAT` step above has already proved
+          # FLOW_PAT is set, and a fallback here would only re-introduce the failure mode as a
+          # `gh` call that succeeds while the push it accompanies cannot.
+          GH_TOKEN: ${{ secrets.FLOW_PAT }}
+        run: |
+          set -euo pipefail
+          # Set by the clone step above, via $GITHUB_ENV. Outside $GITHUB_WORKSPACE by design —
+          # see flow-0064's note on that step. Nothing below may reintroduce a path inside the
+          # working tree, or `git add -A` gets its gitlink back.
+          CANON_TPL="${CANON_DIR}/project-template"
+          # Use canonical's OWN flow-sync logic (the authority), never this repo's possibly-stale copy.
+          SYNC="node $CANON_TPL/.flow/bin/flow-sync.mjs"
+
+          if [ ! -f "$CANON_TPL/.flow/VERSION" ]; then
+            echo "Canonical checkout has no project-template/.flow/VERSION — nothing to adopt."; exit 0
+          fi
+          CANON_VER="$(cat "$CANON_TPL/.flow/VERSION" | tr -d '[:space:]')"
+          LOCAL_VER="$( [ -f .flow/VERSION ] && tr -d '[:space:]' < .flow/VERSION || echo '' )"
+
+          DECISION="$($SYNC decide --local "$LOCAL_VER" --canonical "$CANON_VER")"
+          echo "local='${LOCAL_VER:-<none>}' canonical='$CANON_VER' -> $DECISION"
+          case "$DECISION" in
+            current) echo "Up to date with canonical $CANON_VER — nothing to do."; exit 0 ;;
+            ahead)   echo "::warning::This repo (.flow/VERSION=$LOCAL_VER) is AHEAD of canonical $CANON_VER — a local infra edit, or a tag not yet cut. Reconcile it UPWARD into canonical; flow-sync won't sync backwards."; exit 0 ;;
+            behind)  : ;;
+            *)       echo "::error::Unexpected flow-sync decision '$DECISION'"; exit 1 ;;
+          esac
+
+          BRANCH="$($SYNC branch --canonical "$CANON_VER")"
+
+          # ── GATHER THE FACTS, THEN DECIDE (flow-0075) ──────────────────────────────────────
+          # This block used to be four lines: if `git ls-remote` found the branch, log that "a
+          # sync PR is already open" and exit 0. It never checked. A sync PR closed WITHOUT
+          # merging leaves its branch behind, so that version could never be offered again —
+          # every later run went green claiming a PR was open when none was, and the only way out
+          # was deleting the branch by hand. Observed in CandidDan/Nudge: `flow-sync/2.0.0`
+          # outlived Nudge#286 and needed Nudge#297 to clear it. Nothing reported the problem, so
+          # a repo can sit behind canonical indefinitely while its sync goes green every run.
+          #
+          # The rule now lives in `flow-sync.mjs existing`, where it is a pure function over three
+          # facts and is unit-tested with no network. THIS SHELL ONLY GATHERS FACTS. Each lookup
+          # that fails stops the run with an `::error` NAMING THE LOOKUP — never a fallback
+          # verdict, because in a log `noop` is indistinguishable from a healthy sync, which is
+          # the entire defect being fixed.
+
+          # Fact 1 — does the branch exist on origin, and at what SHA? The SHA is kept because it
+          # is the lease value for the push further down. `refs/heads/$BRANCH` rather than the
+          # bare name so the pattern matches that one ref exactly.
+          if ! LS_REMOTE="$(git ls-remote --heads origin "refs/heads/$BRANCH")"; then
+            echo "::error title=Sync branch lookup failed::git ls-remote --heads origin 'refs/heads/${BRANCH}' failed, so whether the sync branch exists is UNKNOWN. flow-sync will not pick a verdict from a fact it could not gather: guessing 'absent' would force-push over a branch, and guessing 'present' is the silent green this check exists to remove. Re-run once the remote is reachable."
+            exit 1
+          fi
+          REMOTE_SHA="$(printf '%s\n' "$LS_REMOTE" | awk 'NR==1 {print $1}')"
+          if [ -n "$REMOTE_SHA" ]; then BRANCH_EXISTS="yes"; else BRANCH_EXISTS="no"; fi
+
+          OPEN_PR=""
+          HEAD_CANON_SHA=""
+          if [ "$BRANCH_EXISTS" = "yes" ]; then
+            # Fact 2 — is there an OPEN PR from that branch? The question the old code answered
+            # without asking. `--jq '.[].number'` emits the number and NOTHING AT ALL for an empty
+            # result — deliberately never a string literal or a `null`, so the output does not
+            # depend on whether gh renders jq strings raw. `flow-sync.mjs existing` refuses
+            # anything that is not a number or empty, so gh error text cannot be read as "no PR".
+            if ! OPEN_PR="$(gh pr list --head "$BRANCH" --state open --limit 1 --json number --jq '.[].number')"; then
+              echo "::error title=Open-PR lookup failed::gh pr list --head '${BRANCH}' --state open failed, so whether a sync PR is open is UNKNOWN. This is the fact the old idempotency check asserted without ever looking it up. The run stops here rather than assuming either answer."
+              exit 1
+            fi
+            # Fact 3 — which canonical commit was that branch head built from? Read as a git
+            # TRAILER, by git, so nothing here parses a commit message by hand. Empty when the
+            # head carries no `Canonical-SHA:` trailer — every branch built before flow-0075 —
+            # and `existing` treats empty as stale, not as current.
+            if ! git fetch --quiet origin "refs/heads/$BRANCH"; then
+              echo "::error title=Sync branch head unreadable::git fetch of 'refs/heads/${BRANCH}' failed, so the Canonical-SHA trailer recorded on its head is UNKNOWN. Without it there is no way to tell a current sync branch from a stale one, and flow-sync will not guess."
+              exit 1
+            fi
+            if ! HEAD_TRAILER="$(git log -1 --format='%(trailers:key=Canonical-SHA,valueonly)' FETCH_HEAD)"; then
+              echo "::error title=Sync branch head unreadable::git log of the fetched head of '${BRANCH}' failed, so its Canonical-SHA trailer is UNKNOWN. flow-sync will not guess a verdict from it."
+              exit 1
+            fi
+            HEAD_CANON_SHA="$(printf '%s' "$HEAD_TRAILER" | tr -d '[:space:]')"
+          fi
+
+          if ! VERDICT="$($SYNC existing --branch-exists "$BRANCH_EXISTS" --open-pr "$OPEN_PR" \
+                            --head-canonical-sha "$HEAD_CANON_SHA" --canonical-sha "$CANON_SHA")"; then
+            echo "::error title=Sync branch verdict refused::flow-sync refused to turn the facts above into a verdict; its own message is immediately before this line. That is deliberate — an unparseable fact must stop the run rather than become 'noop'."
+            exit 1
+          fi
+
+          # LOG WHAT WAS CHECKED, NEVER WHAT WAS ASSUMED. Every verdict prints the facts it was
+          # reached from. The words "already open" appear below only on the `noop` path, which is
+          # the only one where the open-PR lookup actually returned a PR.
+          echo "branch '$BRANCH': present=${BRANCH_EXISTS}, open PR=${OPEN_PR:-none}, head Canonical-SHA=${HEAD_CANON_SHA:-<none>}, canonical now=${CANON_SHA} -> ${VERDICT}"
+          case "$VERDICT" in
+            noop)
+              echo "A sync PR for $CANON_VER is already open (#${OPEN_PR}) and its head was built from canonical ${CANON_SHA}. Nothing to do."
+              exit 0 ;;
+            create)
+              echo "No '$BRANCH' on origin — building it from canonical ${CANON_SHA} on current main and opening a PR." ;;
+            rebuild)
+              echo "'$BRANCH' exists on origin at ${REMOTE_SHA}, but NO open PR references it: its PR was closed without merging, and before flow-0075 that left $CANON_VER permanently unofferable. Rebuilding the branch from canonical ${CANON_SHA} on current main and opening a fresh PR." ;;
+            refresh)
+              echo "Sync PR #${OPEN_PR} is open, but its head records canonical '${HEAD_CANON_SHA:-<no Canonical-SHA trailer>}', not ${CANON_SHA}. Rebuilding the branch in place; the open PR picks up the new head by itself, so no second PR is opened." ;;
+            *)
+              echo "::error title=Unexpected sync branch verdict::flow-sync printed '${VERDICT}', which is not one of create, rebuild, refresh, noop."
+              exit 1 ;;
+          esac
+
+          # Copy the copied surface from canonical's template. bin: mirror exactly so files
+          # canonical deleted go away here too. Thin callers: refresh in case one changed/was added.
+          mkdir -p .flow/bin .github/workflows
+          rsync -a --delete "$CANON_TPL/.flow/bin/" .flow/bin/
+          # THE CUSTOMISED-CALLER GUARD (flow-0076). This loop was `[ -e "$f" ] && cp "$f" …`, an
+          # unconditional overwrite of the local caller. A caller is meant to be thin, but a repo
+          # that needs something the reusable cannot express adds jobs to its own — CandidDan/Nudge
+          # carried `edge-parse`, `mcp-build` and `mobile-check`, one per tree — and every sync
+          # deleted them while listing the file as "Modified" and saying nothing else. `edge-parse`
+          # is the guard against a Deno parse error reaching production as a BOOT_ERROR; its absence
+          # last cost about seven days of dropped WhatsApp inbounds. A gate that stops checking and
+          # stays green is the failure this whole repo exists to prevent, and a sync was shipping it.
+          #
+          # So: for a caller that ALREADY EXISTS here, ask `flow-sync.mjs extra-jobs` which job keys
+          # the local file declares that canonical's does not. Any answer at all means copying would
+          # destroy work, so the file is left untouched and the run says so. Everything else copies
+          # exactly as before — including a caller NEW to this repo, which has no local file to lose
+          # and is how canonical ships a workflow to a repo that has never heard of it.
+          #
+          # Kept callers are accumulated in a file OUTSIDE the worktree (`git add -A` below would
+          # otherwise commit it) because the list is multi-line and a shell variable cannot gain a
+          # newline inside a YAML block scalar without the closing quote's indentation joining the
+          # string. `pr-body` renders it so a reviewer sees what did not sync, and why.
+          KEPT_FILE="$(mktemp)"
+          for f in "$CANON_TPL"/.github/workflows/flow-*.yml; do
+            [ -e "$f" ] || continue
+            DEST=".github/workflows/$(basename "$f")"
+            if [ -f "$DEST" ]; then
+              # `node "$CANON_TPL/…"` and not `$SYNC`, which is the same command defined 100 lines
+              # up. $SYNC is deliberately not used HERE because two other test files extract this
+              # loop and run it on its own, with only $CANON_TPL supplied — a region that reaches
+              # for a variable defined outside it fails under `set -u` in every one of them. The
+              # loop being self-contained on $CANON_TPL is what keeps it executable in isolation,
+              # which is the only way its behaviour is provable at all.
+              EXTRA="$(node "$CANON_TPL/.flow/bin/flow-sync.mjs" extra-jobs --local "$DEST" --incoming "$f")"
+              if [ -n "$EXTRA" ]; then
+                EXTRA_JOBS="$(printf '%s' "$EXTRA" | tr '\n' ' ' | sed 's/ *$//')"
+                echo "::warning title=Customised caller kept::${DEST} declares job(s) ${EXTRA_JOBS} that canonical's template does not, so copying canonical's version over it would DELETE them. The file is left exactly as it is, and therefore does NOT receive this version's changes to it — reconcile it by hand, or move those checks into .flow/config.yml's source_roots so a thin caller can express them."
+                printf '%s\t%s\n' "$DEST" "$EXTRA_JOBS" >> "$KEPT_FILE"
+                continue
+              fi
+            fi
+            cp "$f" .github/workflows/
+          done
+          KEPT="$(cat "$KEPT_FILE")"
+          # THE PROTOCOL (flow-0048). For four releases this surface was bin + callers + the stamp,
+          # and `.flow/PROTOCOL.md` was copied ONCE, by flow-init, at adoption — then frozen for
+          # the life of the repo through any number of syncs. The protocol is not documentation: it
+          # is the contract every session reads before acting, and the file that decides when a
+          # worker stops. 1.3.1 fixed a session-hygiene trip condition that fired on routine
+          # harness-side truncation, so every fresh worker in CandidDan/later claimed its task,
+          # ran one search, wrote a handoff and ended before implementing anything. The fix was in
+          # canonical, reviewed and released, and no sync would ever have delivered it — the only
+          # route that existed was a hand-patch (CandidDan/later#14), which is the one thing the
+          # hard rule forbids. Worse, the STAMP moved without the content: a sync bumped
+          # .flow/VERSION while leaving the protocol alone, after which flow-sync compared stamps,
+          # reported `current`, and stopped telling the repo it was behind.
+          #
+          # Guarded rather than bare, and not as a silent skip: `canonical_ref` may be pinned to a
+          # release older than the split that created this file (v1.0.0, v1.1.0, v1.1.1 have no
+          # project-template/.flow/PROTOCOL.md), and under `set -e` a bare `cp` would abort the
+          # whole sync for those callers. The warning says which ref, so an absent protocol is a
+          # reported fact rather than an omission someone has to discover the way flow-0048 was.
+          if [ -f "$CANON_TPL/.flow/PROTOCOL.md" ]; then
+            cp "$CANON_TPL/.flow/PROTOCOL.md" .flow/PROTOCOL.md
+          else
+            echo "::warning title=No protocol to adopt::canonical@${CANONICAL_REF} has no project-template/.flow/PROTOCOL.md, so this sync cannot refresh .flow/PROTOCOL.md. That file was split out of CLAUDE.md after v1.1.1; pin canonical_ref at v1.2.0 or later to adopt the protocol."
+          fi
+          #
+          # AGENTS.md and CLAUDE.md are DELIBERATELY EXCLUDED, and this comment is the reason
+          # flow-0048 asked for: they are the same class of file — canonical-authored, copied at
+          # init, never refreshed — but each carries a `## Project notes` section holding *this
+          # repo's* own context below the pointer, so a blind overwrite would destroy repo-specific
+          # content that exists nowhere else. The protocol has no such section: it is identical in
+          # every Flow repo, which is exactly why it is safe to mirror and they are not. Refreshing
+          # the two host files needs a merge that preserves the notes, not a copy, and that is a
+          # separate piece of work. (Post-split they are one-line pointers at the file above, so
+          # the content that used to go stale in them now travels with the protocol.)
+          printf '%s\n' "$CANON_VER" > .flow/VERSION
+
+          # A MESSAGE, NOT A GUARD — it does not exit, and nothing below is conditional on it, so
+          # a sync whose whole payload is new files still commits, pushes and opens its PR. Read
+          # it as commentary. It is also narrower than it looks: `git diff` sees TRACKED files
+          # only, and the `.flow/VERSION` write above is the one change guaranteed to be present,
+          # so this fires only in a repo that had no stamp at all (untracked, therefore invisible
+          # here). Changing its control flow is deliberately out of scope for flow-0054.
+          if git diff --quiet; then
+            echo "Versions differ but no file content changed — bumping the stamp only."
+          fi
+
+          git config user.name  "flow-bot"
+          git config user.email "flow-bot@users.noreply.github.com"
+          # STILL `-b`, on every verdict including `rebuild` and `refresh` (flow-0075). Those two
+          # replace a branch that exists ON ORIGIN, but no LOCAL ref of that name is ever created
+          # here: `actions/checkout` made only `main`, and the fact-gathering fetch above writes
+          # FETCH_HEAD and nothing else. So the branch is genuinely new locally, and it is built
+          # from current `main` with the copy above carried onto it — which is what "rebuilt from
+          # current canonical on current main" means. The replacement happens at the push, under a
+          # lease.
+          #
+          # `-B` was tried and reverted: given local modifications to carry over, `git checkout -B`
+          # prints an `M<TAB><path>` line per file TO STDOUT where `-b` is silent, which lands in
+          # the middle of this step's log for no reason and would corrupt any variable that
+          # captured it.
+          git checkout -b "$BRANCH"
+          git add -A
+          # COMPUTED AFTER `git add -A`, AND `--cached`. DO NOT MOVE IT BACK (flow-0054). This was
+          # `CHANGED="$(git diff --name-only)"` on the line BEFORE the `git add`, which reports the
+          # unstaged worktree diff: tracked files only. Every newly created file was still
+          # untracked at that moment, so none of them appeared. The commit was always right — the
+          # `git add -A` above stages everything — only the list handed to `pr-body` was wrong, and
+          # `pr-body` renders an empty list as "version stamp only — no infra files differed". A
+          # sync delivering nothing but new files therefore opened a PR whose body denied its own
+          # diff. Observed live at TanPlan#26: 37 files, 22 modified and 15 added, and the body
+          # listed exactly the 22 — including the omission of `.github/workflows/flow-compass.yml`,
+          # a file that executes in the adopting repo's CI.
+          #
+          # `--name-status` so the body can distinguish added and removed from modified; an added
+          # workflow is a different review question from a modified one. `--no-renames` so a
+          # rename is reported as the add and the delete it is — both paths matter to a reviewer
+          # deciding whether to accept new CI-executing files — and so the parser never has to
+          # unpick `R100\told\tnew`.
+          CHANGED="$(git diff --cached --no-renames --name-status)"
+          # THE TRAILER (flow-0075). A second `-m` becomes its own paragraph, which is what makes
+          # it a git TRAILER rather than a line of prose — so the next run reads it back with
+          # `git log --format='%(trailers:key=Canonical-SHA,valueonly)'` and nothing parses a
+          # commit message by hand. This is the only record of WHICH canonical tree a sync branch
+          # was built from: `.flow/VERSION` answers "which version", and `canonical_ref` is
+          # normally a moving branch, so the version alone cannot distinguish a current branch
+          # from one built from an older `v2`.
+          git commit -m "flow: adopt canonical Flow infra $CANON_VER" -m "Canonical-SHA: $CANON_SHA"
+          # THE HALF THAT CANNOT BE PREFLIGHTED (flow-0062). Workflows: Write is not introspectable:
+          # a fine-grained PAT exposes no endpoint that reports its own permissions, so the ONLY
+          # test of the scope is to attempt the thing it authorises. This push IS that test, and it
+          # is therefore the first and last moment the scope case can ever be named. Left bare under
+          # `set -e` a rejection aborted the run with git's text alone, which mentions neither
+          # FLOW_PAT nor the scope. Catch it and translate it - git's own message still reaches the
+          # log immediately above the annotation, because it is the primary evidence and this
+          # translation is a reading of it, not a replacement for it.
+          # ONE PUSH, ALWAYS LEASED, ALWAYS `$BRANCH` (flow-0075). `rebuild` and `refresh` replace
+          # a branch that already exists, so they have to force; `flow-sync/*` branches are
+          # bot-owned by construction, which is what makes that legitimate. It is never a bare
+          # `--force`: `--force-with-lease=<ref>:<expect>` pins the remote to $REMOTE_SHA, the
+          # exact value `git ls-remote` reported above, so if a human pushed to the branch between
+          # that lookup and this push, the push is REJECTED and their commit survives.
+          #
+          # $REMOTE_SHA is EMPTY on the `create` path, and git documents an empty <expect> as
+          # "the named ref must not already exist" — so `create` gets a lease too, and a branch
+          # that appeared since the lookup fails loudly instead of being silently overwritten.
+          # One invocation, so there is exactly one push in this file and exactly one thing it can
+          # target: $BRANCH, the name `flow-sync.mjs branch` computed. Nothing else is ever forced.
+          if ! git push --force-with-lease="$BRANCH:$REMOTE_SHA" origin "$BRANCH"; then
+            echo "::error title=flow-sync push refused::git push of '$BRANCH' failed. Git's own message is immediately above this line and is the primary evidence - read it first. If it says GitHub is refusing to allow a GitHub App to create or update workflow files without the 'workflows' permission, then FLOW_PAT authenticated but LACKS Workflows: Write - this commit writes files under .github/workflows/, and GitHub accepts that only from a credential carrying that permission. It cannot be checked before this point - a fine-grained PAT exposes no scope introspection, so using the permission is the only way to test it. Fix - re-issue FLOW_PAT as a fine-grained PAT with Workflows: Write (plus Contents: Read and write, and Pull requests: Read and write), and update this repo's FLOW_PAT secret. If git reported an authentication failure instead, FLOW_PAT expired between the preflight and now, and rotation is the fix. If git reported 'stale info', the LEASE refused the push: '$BRANCH' on origin is no longer at the SHA this run read, so someone pushed to it meanwhile and forcing would have discarded their commit - re-run the sync. Any other git message (a network failure, a non-fast-forward) is what it says it is and is not about FLOW_PAT."
+            exit 1
+          fi
+
+          # `create` and `rebuild` have no PR; `refresh` already has one and GitHub repoints it at
+          # the new head by itself, so opening a second would be a duplicate. A PR closed without
+          # merging stays closed — `rebuild` opens a NEW one rather than reopening it, because the
+          # old one was closed on a tree that no longer exists.
+          case "$VERDICT" in
+            create|rebuild)
+              TITLE="$($SYNC pr-title --local "$LOCAL_VER" --canonical "$CANON_VER")"
+              BODY="$($SYNC pr-body --local "$LOCAL_VER" --canonical "$CANON_VER" --files "$CHANGED" --kept "$KEPT")"
+              gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$BODY" \
+                || echo "gh pr create failed — branch is pushed; will retry next run."
+              ;;
+            refresh)
+              echo "Refreshed the head of sync PR #${OPEN_PR} to canonical ${CANON_SHA}; no new PR opened."
+              ;;
+          esac
