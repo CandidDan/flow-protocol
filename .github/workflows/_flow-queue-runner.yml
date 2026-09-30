@@ -1,0 +1,302 @@
+name: _flow-queue-runner (reusable)
+
+# Reusable form of the queue runner. Repos call it from a thin caller that owns the schedule
+# and the workflow_dispatch input (forwarded here via `with: task_id`); the logic is authored
+# once in canonical. See docs/flow-reusable-workflows.md.
+#
+# Drains the ready queue without you re-running a command per task. Two ways in:
+#   - schedule (in the caller): on a cadence, pick the top ready task (pick-task.mjs) and
+#     dispatch a fresh worker to it. Keep the `ready` queue stocked and the backlog drains.
+#   - workflow_dispatch with a task_id (in the caller, forwarded here): work exactly that task
+#     now. This is also the hook the board's "Work this →" link uses.
+#
+# Each run is a FRESH worker session (a new claude-code-action invocation) — never one long
+# thread across tasks, matching the protocol's "fresh session per task" rule. The worker runs
+# the full loop (claim → branch → build → gate → PR) and STOPS at the PR; merge stays human.
+#
+# DISABLED BY DEFAULT. Enable: repo variable FLOW_AI=true + CLAUDE_CODE_OAUTH_TOKEN secret
+# (`claude setup-token` — uses your Max plan quota, not API credits). The thin caller passes
+# both secrets this reusable declares by name, not `secrets: inherit`.
+
+on:
+  workflow_call:
+    inputs:
+      task_id:
+        description: "Task id to work (e.g. CAN-32). Leave blank to auto-pick the top ready task."
+        required: false
+        type: string
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      FLOW_PAT:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write          # OIDC token minting for claude-code-action
+
+jobs:
+  dispatch:
+    if: ${{ vars.FLOW_AI == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          # The credential this persists in `.git/config` is what the WORKER's `git push` uses
+          # later, and it is the only thing that decides whether that push is accepted. Left at
+          # the default it is GITHUB_TOKEN, and GitHub refuses any GITHUB_TOKEN push that adds or
+          # changes a file under `.github/workflows/` — server-side, however `permissions:` above
+          # is written, because `workflows` is not one of GITHUB_TOKEN's grantable permissions.
+          # The `github_token:` input below does NOT help: it reaches the action's own API calls,
+          # not git's persisted credential. So a worker on a task whose `touches` includes a
+          # workflow file cannot push at all (observed in an adopting repo, flow-0093), and
+          # canonical's own queue has several such tasks. FLOW_PAT is a fine-grained PAT and CAN
+          # carry Workflows: Read and write, so pushing as FLOW_PAT is the fix — see the header
+          # of _flow-open-pr.yml for the full permission list. Unset, this falls back to
+          # GITHUB_TOKEN and behaviour is exactly as before.
+          token: ${{ secrets.FLOW_PAT || secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Choose the task to work
+        id: pick
+        env:
+          INPUT_ID: ${{ inputs.task_id }}
+        run: |
+          id="$INPUT_ID"
+          if [ -z "$id" ]; then id="$(node .flow/bin/pick-task.mjs)"; fi
+          if [ -z "$id" ]; then
+            echo "Queue dry — no ready task with a clear blast radius. Nothing to dispatch."
+            echo "task_id=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dispatching a worker for $id."
+            echo "task_id=$id" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Work the task (fresh worker session)
+        id: work
+        if: ${{ steps.pick.outputs.task_id != '' }}
+        uses: anthropics/claude-code-action@5ccc3a35a6367cdb8e6fbd0728287467540ecfe2 # v1.0.219
+        env:
+          # The worker shells out to `gh` (pr create, pr ready, issue create) and `gh` reads its
+          # credential from the environment, not from the action's `github_token:` input. Without
+          # this the worker inherits whatever `gh` finds — in practice nothing, so `gh pr create`
+          # and `gh issue create` fail outright (the second half of what flow-0093's adopting repo
+          # hit). Same expression as the checkout `token:` above, deliberately: one credential for
+          # everything the worker does to this repo, so its permissions are one list to reason
+          # about rather than two that can disagree.
+          GH_TOKEN: ${{ secrets.FLOW_PAT || secrets.GITHUB_TOKEN }}
+        with:
+          # Subscription auth (Pro/Max) — uses your plan quota, not API credits.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # GitHub API token for the action's git/PR operations. FLOW_PAT (a real actor, CAN-58)
+          # so the worker's own branch push fires _flow-open-pr.yml on the fast path — pushes made
+          # with the Actions GITHUB_TOKEN don't trigger downstream workflows (GitHub's recursion
+          # guard), which left worker branches sitting PR-less until the _flow-recover sweep or a
+          # human noticed. Falls back to GITHUB_TOKEN when the secret isn't set: exactly today's
+          # behaviour (branch pushes silently, _flow-open-pr/_flow-recover catch up after the
+          # fact). See _flow-open-pr.yml's header for the ONE FLOW_PAT permission list every
+          # workflow shares (flow-0093: Contents, Pull requests, Issues and Workflows, all Read
+          # and write — the worker needs every one of the four). One difference for THIS
+          # consumer, and it is not about permissions:
+          #   - Exposure model: open-pr/recover/sync only hand FLOW_PAT to fixed gh/git commands
+          #     in deterministic run: blocks. Here it enters the worker agent's environment
+          #     (bypassPermissions bash over task-file-derived prompts), and unlike the
+          #     job-scoped GITHUB_TOKEN a PAT outlives the run — so use a short-expiry
+          #     fine-grained PAT and rotate it; don't assume open-pr's risk profile applies.
+          github_token: ${{ secrets.FLOW_PAT || secrets.GITHUB_TOKEN }}
+          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}   # pay-per-use alternative
+          # The build role gets the strongest model — fewer blocks/kickbacks = fewer human
+          # touchpoints, which is the whole point of the loop. Alias (not a pinned version) so it
+          # tracks the latest Opus. Note: heavier on Max-plan quota than Sonnet. The independent
+          # reviewer (flow-review) is deliberately left on a different model for genuine diversity.
+          #
+          # model + permissions go through claude_args, NOT as top-level inputs. This action version
+          # has no `model` input — passing one emitted "Unexpected input(s) 'model'" and silently fell
+          # back to the default Sonnet (so `model: opus` never took effect). And a headless worker has
+          # nobody to approve tool prompts: without an explicit permission posture, every Bash call
+          # (the git claim-push, the branch, `gh pr create`, npm/gate commands) is DENIED — the worker
+          # burns its turns, claims nothing, and ends "successfully" having pushed no branch and opened
+          # no PR (observed on the canary repo: 17 permission denials per run, all ready tasks left untouched).
+          # `--permission-mode bypassPermissions` makes the loop autonomous on an ephemeral, trusted CI
+          # runner; scope stays fenced by the task's `touches` + the touches-guard CI gate, not by
+          # per-tool prompts.
+          # --max-turns 120 (was 60): a full task is implement + tests-per-criterion + iterate to
+          # green build/lint/test + clear the coverage floor + three review subagents + open the PR.
+          # Heavier dashboard tasks consistently overran 60 (error_max_turns ~15-21min runs, no PR),
+          # so the cap was failing them after real work. 120 covers the hard ones; raise further if a
+          # task still caps. (Cost scales with turns — that's the trade for a finished PR over a wasted run.)
+          # Before raising it again, check that the run was not fighting something else: a repeating
+          # error_max_turns on the SAME task is a symptom, not a verdict on the cap. The date-only
+          # `started` bug (fixed in _flow-recover.yml) had flow-recover un-claiming live tasks about a
+          # minute after every claim, so each worker built against a task main said was unowned and each
+          # hourly run restarted from zero — three capped runs on one task, ~$13 each, before anyone
+          # suspected the cap. Raising the cap there would only have bought more expensive failures.
+          # Confirm work is actually carrying forward (a branch pushed, a `notes` entry on main) before
+          # concluding the task genuinely needs more turns. A task that truly cannot fit is oversized:
+          # splitting it beats buying turns.
+          claude_args: "--max-turns 120 --model opus --permission-mode bypassPermissions"
+          prompt: |
+            You are the Flow worker for a single task. Read CLAUDE.md (the protocol) and the task
+            file in .flow/tasks/ whose id is "${{ steps.pick.outputs.task_id }}". Run the full loop:
+
+            1. CLAIM: git pull --rebase; set the task to in_progress with owner + started; commit
+               that task file to main and push. `started` must be the full UTC ISO datetime
+               (`date -u +%Y-%m-%dT%H:%M:%SZ`), never a bare date — flow-recover ages your claim
+               off that field and a date-only value reads as that morning's midnight, so the
+               sweep resets the task out from under you minutes after you claim it. If the push
+               is rejected, another worker claimed it — stop, do nothing further.
+            2. BRANCH off latest main: flow/${{ steps.pick.outputs.task_id }}-<slug>.
+            3. BUILD strictly against the task's acceptance criteria and within its declared
+               `touches` — nothing more, nothing outside those globs.
+            4. GATE: run the project's build/lint/test/coverage from .flow/config.yml. Fix
+               failures; do not open the PR until all four pass. Do NOT run any review subagent
+               — the qa, security and code-review gates are checks on the PR (flow-review.yml),
+               deliberately outside your session so the work and its reviewer are not the same
+               context. Your job is to make them pass, not to run them.
+            5. PR: open it titled "[${{ steps.pick.outputs.task_id }}] <title>", link the task
+               file, paste the acceptance checklist with the proving test for each item. STOP —
+               do not merge.
+
+            If a real decision is needed that the task didn't settle, set the task `blocked` with
+            a `blocked_reason` and stop rather than guessing. Never widen scope past `touches`.
+
+            PUSH EARLY, AND LEAVE A HANDOFF. You are running under a hard turn cap; when you hit
+            it the session is killed mid-thought, with no chance to save anything. Two habits
+            make that survivable instead of total loss, and CLAUDE.md's *Session hygiene* rule
+            requires both of you:
+              - Push your branch as soon as it has one meaningful commit, and keep pushing as you
+                go. Do not save it all for PR time. A pushed branch is what flow-recover needs to
+                reopen the work instead of resetting the task to `ready`; an unpushed branch dies
+                with the runner.
+              - Append a `notes` entry to the task file on `main` whenever you finish a
+                substantial step, covering what is genuinely done, what only looks done, the
+                branch name, and the exact next action. Commit it to `main` as you go — a note
+                you were planning to write at the end is a note that never gets written.
+            A capped run that pushed a branch and left a note costs one cycle. A capped run that
+            pushed nothing costs the whole run, and the next worker starts from zero.
+
+      # The protocol's definition of a finished run is one of exactly three outcomes: a pushed
+      # `flow/<id>-*` branch ahead of main, an open PR, or a `blocked` transition with a reason.
+      # A worker can burn its turns, exit 0, and produce none of them (observed on
+      # CandidDan/write, runs 32869817466 / 32821080230: SDK said `is_error: false`, job
+      # concluded success, nothing existed to show for it) — so the job must not take the
+      # worker's exit code as the verdict. This step re-derives the outcome from the remote and
+      # fails the job when none of the three happened, which is what makes a wasted run visible
+      # in Actions history instead of indistinguishable from a real one. It runs whether the
+      # worker step passed or failed (only a cancelled run skips it): a worker that exits 0
+      # having done nothing is exactly the case `if: failure()` would miss. A `notes` entry
+      # alone deliberately does NOT count — a note warms up the next worker, but it is not a
+      # finished or blocked outcome (see flow-0025 / issue #33). flow-recover still owns
+      # healing the claim; this step only stops the run from lying about its own result.
+      - name: Verify the worker produced an outcome
+        # `id:` so the facts derived below survive the step. They are the same three facts that
+        # decide what `Explain what happens to the claim` has to say, and until flow-0049 they
+        # were shell locals this step threw away — leaving the notice to print a hypothetical
+        # from a job that already knew the answer.
+        id: verify
+        if: ${{ !cancelled() && steps.pick.outputs.task_id != '' }}
+        env:
+          TASK_ID: ${{ steps.pick.outputs.task_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Bootstrap guard: the helper lives in the consuming repo once it adopts the template.
+          # A repo that hasn't synced it yet must not have its queue-runner start failing here.
+          if [ ! -f .flow/bin/queue-runner-verify.mjs ]; then
+            echo "No .flow/bin/queue-runner-verify.mjs in this repo yet — skipping outcome verification."
+            exit 0
+          fi
+          # Everything the worker produced landed on the remote after this job's checkout, so
+          # every fact is read from origin, never from the local worktree the worker mutated.
+          git fetch -q origin main
+          branch="$(git ls-remote --heads origin "flow/$TASK_ID-*" | head -1 | sed 's#.*refs/heads/##')"
+          if [ -n "$branch" ]; then
+            branch_exists=1
+            git fetch -q origin "$branch"
+            ahead="$(git rev-list --count origin/main..FETCH_HEAD)"
+            has_open_pr="$(gh pr list --head "$branch" --state open --json number --jq 'length')"
+          else
+            branch_exists=0; ahead=0; has_open_pr=0
+          fi
+          # A cloud/harness worker can be forced onto a non-flow/ branch; the protocol makes
+          # the [<id>] PR-title prefix load-bearing for exactly that case, so check it too.
+          # Filtered in node with the id passed via the environment — not interpolated into a
+          # jq program — because workflow_dispatch task ids are untrusted input.
+          if [ "$has_open_pr" = "0" ]; then
+            has_open_pr="$(gh pr list --state open --json title | node -e '
+              const prs = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+              const prefix = "[" + process.env.TASK_ID + "]";
+              process.stdout.write(String(prs.filter((p) => p.title.startsWith(prefix)).length));
+            ')"
+          fi
+          # Publish the facts BEFORE the verdict below, never after: the helper exits non-zero on
+          # a wasted run, and a `run:` block stops at the first failing command — so outputs
+          # written after it would be missing on exactly the path that needs them. `facts_known`
+          # is the flag the explain step keys off; the bootstrap guard above returns early, so an
+          # unsynced repo publishes nothing and that step falls back to its generic text.
+          # `branch` comes from `git ls-remote | sed` and is a single ref name by construction
+          # (refs cannot contain whitespace or newlines), so it cannot forge extra output lines.
+          {
+            echo "facts_known=1"
+            echo "branch=$branch"
+            echo "branch_exists=$branch_exists"
+            echo "ahead=$ahead"
+            echo "has_open_pr=$has_open_pr"
+          } >> "$GITHUB_OUTPUT"
+          # The task's state lives on main, which moved after checkout if the worker claimed or
+          # blocked it — refresh the store from origin/main so the helper reads current state.
+          git checkout -q origin/main -- .flow/tasks/
+          node .flow/bin/queue-runner-verify.mjs --task-id "$TASK_ID" \
+            --branch-exists "$branch_exists" --ahead "$ahead" --has-open-pr "$has_open_pr"
+
+      # A capped/failed worker exits non-zero having opened no PR, and the raw log says only
+      # "Claude execution failed". State the consequence explicitly so the run is diagnosable
+      # from the summary alone: the claim is NOT released here, and must not be — releasing it
+      # from the failure path would race a worker that is still finishing. flow-recover owns
+      # that decision, on its own schedule, from the evidence on the remote.
+      #
+      # `if: failure()` is ANY step failing, not specifically a worker that produced nothing, so
+      # this step must not assert an absence it never checked: a worker that pushes, opens its
+      # PR and *then* exits non-zero fires this step too. It therefore renders the outcome the
+      # verify step above actually observed (`renderClaimNotice`, colocated with the decision it
+      # describes) rather than the two-branch hypothetical it used to print.
+      - name: Explain what happens to the claim
+        if: ${{ failure() && steps.pick.outputs.task_id != '' }}
+        env:
+          TASK_ID: ${{ steps.pick.outputs.task_id }}
+          FACTS_KNOWN: ${{ steps.verify.outputs.facts_known }}
+          BRANCH: ${{ steps.verify.outputs.branch }}
+          BRANCH_EXISTS: ${{ steps.verify.outputs.branch_exists }}
+          AHEAD: ${{ steps.verify.outputs.ahead }}
+          HAS_OPEN_PR: ${{ steps.verify.outputs.has_open_pr }}
+        run: |
+          # No facts, no claim about them. Two ways to get here: the repo has not synced the
+          # helper yet (the verify step's bootstrap guard no-ops, publishing nothing, and there
+          # is no renderer to call either), or that step died before publishing. Both fall back
+          # to the generic two-branch text — which is honest when the outcome is genuinely
+          # unknown, and is the only copy of it, so the two paths cannot drift.
+          if [ "$FACTS_KNOWN" != "1" ] || [ ! -f .flow/bin/queue-runner-verify.mjs ]; then
+            {
+              echo "### Worker run failed for \`$TASK_ID\`"
+              echo
+              echo "The claim on \`$TASK_ID\` is left as-is — **flow-recover** resolves it on the"
+              echo "next sweep, and which way it goes depends on what this run managed to push:"
+              echo
+              echo "- **branch pushed, ahead of \`main\`** → the PR is re-opened from that branch,"
+              echo "  and the work survives."
+              echo "- **nothing pushed** → the task resets to \`ready\` once it passes the staleness"
+              echo "  threshold, and the next queue-runner starts it over from zero."
+              echo
+              echo "If this is the same task capping repeatedly, the cap is the symptom to look"
+              echo "past, not the thing to raise: check that a branch and a \`notes\` entry are"
+              echo "actually landing between runs, then consider splitting the task."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node .flow/bin/queue-runner-verify.mjs --mode explain --task-id "$TASK_ID" \
+            --branch "$BRANCH" --branch-exists "$BRANCH_EXISTS" --ahead "$AHEAD" \
+            --has-open-pr "$HAS_OPEN_PR" >> "$GITHUB_STEP_SUMMARY"
