@@ -1,0 +1,62 @@
+name: flow-sync
+
+# Thin caller — the Flow infra adopt mechanism (propagation plan, Phase 4) lives in canonical
+# (CandidDan/flow) as a reusable workflow, adopted here by reference. When this repo's
+# .flow/VERSION falls behind canonical, it opens a REVIEWED PR pulling the update in — the
+# complement to flow-doctor's drift *warning*. FLOW_PAT is passed by name (CAN-58) so the sync
+# PR triggers flow-gates, not via `secrets: inherit`: this job has no use for
+# CLAUDE_CODE_OAUTH_TOKEN and should not carry it. See docs/flow-reusable-workflows.md in the
+# flow repo.
+#
+# REQUIRED SETUP: FLOW_PAT must be a fine-grained PAT carrying **Workflows: Write** on this repo
+# (plus Contents and Pull requests, read and write). flow-sync copies canonical's thin callers
+# into `.github/workflows/`, and only a token with the `workflows` scope may push there. This is
+# a credential requirement, not a permission one — see the permissions block below. Without it
+# the reusable stops on its first step with a message naming this secret.
+#
+# Safe to run anytime: it only ever opens a reviewed PR (never auto-merges, never pushes to main),
+# so it needs no FLOW_AI gate.
+#
+# WHICH REF IT ADOPTS FROM (flow-0105). Nothing to set by hand. On the weekly `schedule` the
+# `canonical_ref` input below is empty, and the reusable reads the ref off the `@<ref>` on THIS
+# file's `uses:` line instead — so repinning this repo is the one `sed` over `.github/workflows/`
+# and the sync follows. If two callers in this repo disagree about the ref, the sync fails and names
+# both rather than guessing. A `workflow_dispatch` run overrides all of that: whatever you type in
+# the input wins, which is how you adopt from a canary ref once without repinning anything.
+
+on:
+  schedule:
+    - cron: "27 6 * * 1"       # weekly, Monday ~06:27 UTC — off the :00 mark
+  workflow_dispatch:
+    inputs:
+      canonical_ref:
+        description: "Canonical ref to adopt from (tag/branch). Default v3."
+        required: false
+        type: string
+
+concurrency:
+  group: flow-sync
+  cancel-in-progress: false
+
+jobs:
+  flow-sync:
+    permissions:
+      contents: write
+      pull-requests: write
+      # Do NOT add `workflows: write` here. It is not a GITHUB_TOKEN permission and never was:
+      # the set is closed at actions, attestations, checks, contents, deployments, discussions,
+      # id-token, issues, models, packages, pages, pull-requests, repository-projects,
+      # security-events and statuses. `workflows` belongs to GitHub Apps and fine-grained PATs
+      # only — which is exactly why GITHUB_TOKEN cannot push under `.github/workflows/`, and why
+      # no permissions block can grant its way out of that.
+      #
+      # An earlier version of this file carried the line, and GitHub's parser refused to read the
+      # whole workflow: "failed to parse workflow: (Line: 43, Col: 7): Unexpected value
+      # 'workflows'". A repo that adopted it got a startup failure instead of a sync — worse than
+      # the push failure it was meant to fix. The scope comes from FLOW_PAT instead (see the
+      # REQUIRED SETUP note at the top of this file).
+    uses: CandidDan/flow/.github/workflows/_flow-sync.yml@v3
+    with:
+      canonical_ref: ${{ inputs.canonical_ref }}
+    secrets:
+      FLOW_PAT: ${{ secrets.FLOW_PAT }}
