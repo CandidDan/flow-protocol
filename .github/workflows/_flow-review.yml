@@ -1,0 +1,957 @@
+name: _flow-review (reusable)
+
+# The three Definition-of-Done reviewers — qa, code-review, security — as CHECKS ON THE PR
+# (flow-0007). They used to run as subagents inside the worker's own session, which made the
+# worker the certifier of its own work: same context, same assumptions, same blind spots. Every
+# other guard in Flow refuses to take the worker's word for it — touches-guard enforces scope in
+# CI, the store-guard fails a PR that edits task state, flow-doctor validates the store rather
+# than trusting it. These now work the same way.
+#
+# Portability follows from the integrity fix rather than the other way round: the reviewer is
+# still a model call and still Claude. What changes is that THE WORKER no longer has to be the
+# same vendor as the reviewer — a PR from any agent, or from a human, gets the identical checks.
+#
+# Repos call this from a thin caller that owns the pull_request trigger; the logic is authored
+# once in canonical. See docs/flow-reusable-workflows.md.
+#
+# WHAT IS NOT A MODEL CALL. A model call always exits 0, so the two pieces that actually block
+# live in `.flow/bin/flow-review.mjs`, with proving tests:
+#   · `plan`    — reads `review:` from the CALLER's .flow/config.yml (model, security trigger
+#                 paths), decides whether the conditional security review applies to this diff,
+#                 and materialises the bounded context the reviewers may read.
+#   · `verdict` — turns each reviewer's written verdict into an exit code, FAIL-CLOSED: a
+#                 missing, empty or unparseable verdict fails the check. A reviewer that died
+#                 mid-run must never read as an approval.
+#
+# NO MODEL IS NAMED IN THIS FILE. `review.model` / `review.security_model` in the consuming
+# repo's .flow/config.yml decide it — data the project tunes, not shared infra it has to patch.
+#
+# BLOCKING. These three block, in the same way a failed test blocks. Keep advisory reviewers
+# (e.g. GitHub Copilot code review, enabled repo-side) advisory: two blocking AI reviewers
+# deadlock on nitpicks, which the README already warns about.
+#
+# DISABLED BY DEFAULT. Enable with repo variable FLOW_AI=true + the CLAUDE_CODE_OAUTH_TOKEN
+# secret (from `claude setup-token` — uses your Max plan quota, not API credits). The thin
+# caller passes it by name, not `secrets: inherit`.
+#
+# THE FORK BOUNDARY IS FENCED HERE, NOT INHERITED. GitHub withholds secrets from a `pull_request`
+# run on a fork PR, so the reviewers could never authenticate there — but they still STARTED:
+# three jobs checked out the PR head and ran `node .flow/bin/flow-review.mjs` FROM THAT HEAD
+# before claude-code-action was reached. Under `pull_request` the platform contains that. The
+# problem is that the containment is a property of a file this workflow does not own: THE THIN
+# CALLER OWNS THE TRIGGER, in the adopting repo, at a tag it has already pinned. A caller edited
+# to `pull_request_target` — which looks like a fix for "our fork PRs get no review" — would hand
+# fork-authored code and a fork-authored diff to three jobs running `--permission-mode
+# bypassPermissions` with this workflow's `pull-requests: write`, `id-token: write` and a real
+# CLAUDE_CODE_OAUTH_TOKEN. Canonical cannot patch that downstream, so `plan` compares the head
+# repo against this one and the fence holds whatever the caller does. Review fork contributions
+# on a branch in the repo.
+#
+# THE GATE IS EXECUTED FROM THE BASE BRANCH, NOT FROM THE PR (flow-0079). `plan` used to run
+# `node .flow/bin/flow-review.mjs` out of the PR checkout, reading `.flow/config.yml` from that
+# same checkout — so both the code that decides and the config that scopes it were controlled by
+# the diff being decided about. A PR could delete the `review.security_paths` glob covering its
+# own change and the security review would skip, "visibly", with a reason that read as legitimate;
+# a PR could edit `verdict` itself, which is the code that turns a reviewer's words into a red
+# check. flow-0068 fenced FORK PRs; this is the same hole for PRs from inside the repo, which is
+# every PR the queue runner opens. So each job now materialises the base branch in a scratch
+# worktree under RUNNER_TEMP and runs THAT helper against THAT config, while the diff, the changed
+# files and the task still come from the PR. A worktree rather than a `git show` of the one file,
+# because the helper is not one file: it imports touches-guard.mjs and parse-task-id.mjs, and in
+# canonical it is an adapter over project-template/.flow/bin/. Materialising the tree is what
+# makes "the base branch's copy" mean the whole of it.
+#
+# THE SECURITY FLOOR is the other half. Even read from base, `security_paths` is a list a repo can
+# legitimately scope tightly — so `.flow/**`, `.github/**`, `.claude/**`, `CLAUDE.md` and
+# `AGENTS.md` trigger the security review regardless of it. Those are the paths that decide what
+# every gate does; a repo scoping its product code is not asking for its CI to be unreviewable.
+# The floor lives in the helper (`SECURITY_FLOOR_PATHS`), not here, so it is testable.
+#
+# BOOTSTRAP. A repo adopting the review gate in this very PR has no gate on base to plan from.
+# That case uses the PR's own helper, FORCES the security review on, and says so in the run
+# summary. Fail-closed, never skipped, and never silent.
+#
+# This is NOT an author fence, and the distinction is criterion 6 of flow-0007. `allowed_bots: "*"`
+# stays, nothing inspects who triggered the run or what the branch is called, and a PR from a
+# human or a non-Claude agent gets the identical checks. What is fenced is whose CODE the runner
+# executes. (The two expressions that would re-fence authorship are named in
+# flow-review-workflow.test.mjs, which forbids them anywhere in this file — including in a comment
+# like this one, which is why it describes them instead of quoting them.)
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: "Node used to run .flow/bin/flow-review.mjs (the helper is dependency-free)."
+        required: false
+        type: string
+        default: "22"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write          # OIDC token minting for claude-code-action
+
+jobs:
+  # ── plan ───────────────────────────────────────────────────────────────────────────────
+  # Reads the repo's own review config and decides the conditional security review, once, so
+  # every reviewer below runs on the same decision and the human sees it in the run summary.
+  plan:
+    # The draft clause is flow-0039, and it is the single gate for all four jobs: `qa`,
+    # `code-review` and `security` each declare `needs: plan`, so suppressing `plan` suppresses
+    # them. Without it the three Definition-of-Done reviewers ran on `opened` — which flow-open-pr
+    # triggers on the FIRST push — and again on every `synchronize`, i.e. three agent invocations
+    # per work-in-progress push against code the worker had not finished writing. The caller lists
+    # `ready_for_review` in its `types:`, so the reviewers fire once, when the worker hands off.
+    # `github.event.pull_request.draft` is present on every `pull_request` event; on any other event
+    # it is empty, which is why this compares against 'true' rather than testing for false.
+    #
+    # The third clause is the fork fence (see the header). `plan` is the only place it belongs:
+    # the other three jobs declare `needs: plan`, so suppressing this suppresses all of them,
+    # and `security` keeps no job-level `if` of its own — one that vanished from the PR on a skip
+    # is indistinguishable from a gate that broke.
+    if: ${{ vars.FLOW_AI == 'true' && github.event.pull_request.draft != true && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    outputs:
+      model: ${{ steps.plan.outputs.model }}
+      security_model: ${{ steps.plan.outputs.security_model }}
+      security_run: ${{ steps.plan.outputs.security_run }}
+      security_reason: ${{ steps.plan.outputs.security_reason }}
+      task_id: ${{ steps.plan.outputs.task_id }}
+      # flow-0103. The truncation fact, decided ONCE here and read by all three verdict steps, so
+      # a PASS on a diff the plan clipped cannot clear a check. It is published as a job output
+      # rather than read from each reviewer's own bounded-context step for two reasons: the three
+      # checks must agree about what was reviewed, and the reviewer itself writes into the
+      # workspace — a fact it could overwrite is not a fact. The byte counts are reporting only.
+      diff_truncated: ${{ steps.plan.outputs.diff_truncated }}
+      diff_bytes: ${{ steps.plan.outputs.diff_bytes }}
+      diff_full_bytes: ${{ steps.plan.outputs.diff_full_bytes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Materialise the review gate from the BASE branch
+        # flow-0079. Everything that DECIDES comes from base; everything that is DECIDED ABOUT
+        # comes from the PR. The env vars written below are what keeps those two apart —
+        # `FLOW_REVIEW_DIR` + `FLOW_CONFIG` + `REVIEW_TASKS_DIR` (the task file and its acceptance
+        # criteria, flow-0085) point at base, `REVIEW_REPO_DIR` / `REVIEW_OUT_DIR` point back at
+        # the PR checkout. `REVIEW_REPO_DIR` is load-bearing for
+        # a repo whose `.flow/bin/flow-review.mjs` is an ADAPTER (canonical's is): an adapter pins
+        # its git to its own realpath, which inside the base worktree would diff base against
+        # itself and hand the reviewers an empty patch.
+        #
+        # The branch name reaches the shell through `env:`, not `${{ }}` — same rule as the PR
+        # title and `security_reason`. A ref name is less attacker-chosen than a title, but the
+        # rule is cheaper to keep than to reason about case by case.
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -eu
+          git fetch -q origin "$BASE_BRANCH"
+          base_dir="$RUNNER_TEMP/flow-review-base"
+          rm -rf "$base_dir"
+          git worktree prune
+          if git cat-file -e "origin/$BASE_BRANCH:.flow/bin/flow-review.mjs" 2>/dev/null \
+             && git cat-file -e "origin/$BASE_BRANCH:.flow/config.yml" 2>/dev/null; then
+            git worktree add -q --detach "$base_dir" "origin/$BASE_BRANCH"
+            {
+              echo "FLOW_REVIEW_DIR=$base_dir/.flow/bin"
+              echo "FLOW_CONFIG=$base_dir/.flow/config.yml"
+              # flow-0085: the task file is the STANDARD the PR is judged against, so it comes
+              # from base too. A PR that edits its own acceptance criteria must not hand the
+              # reviewers the edited copy.
+              echo "REVIEW_TASKS_DIR=$base_dir/.flow/tasks"
+            } >> "$GITHUB_ENV"
+          elif [ -f .flow/bin/flow-review.mjs ]; then
+            # BOOTSTRAP — this PR is the one adopting the gate. The helper below forces the
+            # security review on (REVIEW_BOOTSTRAP) and repeats this warning in the plan summary.
+            {
+              echo "FLOW_REVIEW_DIR=$GITHUB_WORKSPACE/.flow/bin"
+              echo "REVIEW_BOOTSTRAP=1"
+              # No independent copy exists on base, so the task file can only come from the PR.
+              echo "REVIEW_TASKS_DIR=$GITHUB_WORKSPACE/.flow/tasks"
+            } >> "$GITHUB_ENV"
+            echo "::warning::BOOTSTRAP: the base branch carries no review gate, so this PR's own" \
+                 "copy is planning the review of this PR. The security review is forced on."
+            printf '### Flow review gate — :warning: BOOTSTRAP\n\n%s\n\n' \
+              'The base branch carries no `.flow/bin/flow-review.mjs` and/or no `.flow/config.yml`, so the gate was planned from THIS PR rather than from an independent copy. The security review is forced on. Expected exactly once, on the PR that adopts the review gate.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Neither base nor this PR has the helper: an adopting repo that bumped the workflow
+            # tag but has not run flow-sync. Say so, instead of failing on "node: not found".
+            echo "::error::.flow/bin/flow-review.mjs is missing from this PR and from the base" \
+                 "branch. This repo adopted a newer _flow-review.yml than its .flow/bin/ — run" \
+                 "the flow-sync workflow to adopt the helper, then re-run these checks."
+            exit 1
+          fi
+          {
+            echo "REVIEW_REPO_DIR=$GITHUB_WORKSPACE"
+            echo "REVIEW_OUT_DIR=$GITHUB_WORKSPACE/.flow-review"
+          } >> "$GITHUB_ENV"
+      - name: Plan the review — model, security trigger, bounded context
+        id: plan
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          # CAN-52: the task id has two sources and the helper resolves both in code. The branch
+          # arrives as `github.head_ref` — the underscore form, deliberately. The dotted
+          # `pull_request` spelling of the same value is forbidden ANYWHERE in this file by
+          # `flow-review-workflow.test.mjs`, so that a real branch fence cannot be smuggled in
+          # behind an id lookup; that test refuses prose too, which is why this comment does not
+          # spell it either. A branch NAME here is an id source, never a gate. The PR title is
+          # attacker-controlled text: it travels through `env`, where it is data, and is never
+          # interpolated into the shell.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node "$FLOW_REVIEW_DIR"/flow-review.mjs plan
+
+  # Each reviewer below re-runs `plan` to materialise its own .flow-review/ rather than taking
+  # an artifact from the plan job. Two git diffs are cheaper than an upload/download round trip,
+  # and it keeps two more third-party actions out of the supply chain every adopting repo
+  # inherits — the concern .flow/config.yml lists under `uses:` pins.
+
+  # ── qa ─────────────────────────────────────────────────────────────────────────────────
+  # The real correctness gate: every acceptance criterion has a test that asserts its OUTCOME.
+  # Coverage and the command exits are backstops — a green coverage number with an unproven
+  # criterion is still a FAIL.
+  qa:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Materialise the review gate from the BASE branch
+        # flow-0079. Everything that DECIDES comes from base; everything that is DECIDED ABOUT
+        # comes from the PR. The env vars written below are what keeps those two apart —
+        # `FLOW_REVIEW_DIR` + `FLOW_CONFIG` + `REVIEW_TASKS_DIR` (the task file and its acceptance
+        # criteria, flow-0085) point at base, `REVIEW_REPO_DIR` / `REVIEW_OUT_DIR` point back at
+        # the PR checkout. `REVIEW_REPO_DIR` is load-bearing for
+        # a repo whose `.flow/bin/flow-review.mjs` is an ADAPTER (canonical's is): an adapter pins
+        # its git to its own realpath, which inside the base worktree would diff base against
+        # itself and hand the reviewers an empty patch.
+        #
+        # The branch name reaches the shell through `env:`, not `${{ }}` — same rule as the PR
+        # title and `security_reason`. A ref name is less attacker-chosen than a title, but the
+        # rule is cheaper to keep than to reason about case by case.
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -eu
+          git fetch -q origin "$BASE_BRANCH"
+          base_dir="$RUNNER_TEMP/flow-review-base"
+          rm -rf "$base_dir"
+          git worktree prune
+          if git cat-file -e "origin/$BASE_BRANCH:.flow/bin/flow-review.mjs" 2>/dev/null \
+             && git cat-file -e "origin/$BASE_BRANCH:.flow/config.yml" 2>/dev/null; then
+            git worktree add -q --detach "$base_dir" "origin/$BASE_BRANCH"
+            {
+              echo "FLOW_REVIEW_DIR=$base_dir/.flow/bin"
+              echo "FLOW_CONFIG=$base_dir/.flow/config.yml"
+              # flow-0085: the task file is the STANDARD the PR is judged against, so it comes
+              # from base too. A PR that edits its own acceptance criteria must not hand the
+              # reviewers the edited copy.
+              echo "REVIEW_TASKS_DIR=$base_dir/.flow/tasks"
+            } >> "$GITHUB_ENV"
+          elif [ -f .flow/bin/flow-review.mjs ]; then
+            # BOOTSTRAP — this PR is the one adopting the gate. The helper below forces the
+            # security review on (REVIEW_BOOTSTRAP) and repeats this warning in the plan summary.
+            {
+              echo "FLOW_REVIEW_DIR=$GITHUB_WORKSPACE/.flow/bin"
+              echo "REVIEW_BOOTSTRAP=1"
+              # No independent copy exists on base, so the task file can only come from the PR.
+              echo "REVIEW_TASKS_DIR=$GITHUB_WORKSPACE/.flow/tasks"
+            } >> "$GITHUB_ENV"
+            echo "::warning::BOOTSTRAP: the base branch carries no review gate, so this PR's own" \
+                 "copy is planning the review of this PR. The security review is forced on."
+            printf '### Flow review gate — :warning: BOOTSTRAP\n\n%s\n\n' \
+              'The base branch carries no `.flow/bin/flow-review.mjs` and/or no `.flow/config.yml`, so the gate was planned from THIS PR rather than from an independent copy. The security review is forced on. Expected exactly once, on the PR that adopts the review gate.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Neither base nor this PR has the helper: an adopting repo that bumped the workflow
+            # tag but has not run flow-sync. Say so, instead of failing on "node: not found".
+            echo "::error::.flow/bin/flow-review.mjs is missing from this PR and from the base" \
+                 "branch. This repo adopted a newer _flow-review.yml than its .flow/bin/ — run" \
+                 "the flow-sync workflow to adopt the helper, then re-run these checks."
+            exit 1
+          fi
+          {
+            echo "REVIEW_REPO_DIR=$GITHUB_WORKSPACE"
+            echo "REVIEW_OUT_DIR=$GITHUB_WORKSPACE/.flow-review"
+          } >> "$GITHUB_ENV"
+      - name: Bounded context — the diff and the files it changes
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          # CAN-52: the task id has two sources and the helper resolves both in code. The branch
+          # arrives as `github.head_ref` — the underscore form, deliberately. The dotted
+          # `pull_request` spelling of the same value is forbidden ANYWHERE in this file by
+          # `flow-review-workflow.test.mjs`, so that a real branch fence cannot be smuggled in
+          # behind an id lookup; that test refuses prose too, which is why this comment does not
+          # spell it either. A branch NAME here is an id source, never a gate. The PR title is
+          # attacker-controlled text: it travels through `env`, where it is data, and is never
+          # interpolated into the shell.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node "$FLOW_REVIEW_DIR"/flow-review.mjs plan
+      - uses: anthropics/claude-code-action@5ccc3a35a6367cdb8e6fbd0728287467540ecfe2 # v1.0.219
+        continue-on-error: true          # the verdict step below decides; never this action's exit
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Flow worker PRs are opened by a bot, so the reviewer must accept a bot-initiated run.
+          # This is also what makes criterion 6 true: the checks do not care who authored the PR.
+          allowed_bots: "*"
+          # The model comes from the repo's .flow/config.yml. Nothing here names one.
+          claude_args: "--max-turns 60 --model ${{ needs.plan.outputs.model }} --permission-mode bypassPermissions"
+          prompt: |
+            You are the QA gate for this pull request. You did not write this code and owe it
+            nothing. You do not write feature code; you decide pass/fail, and you are hard to fool.
+
+            YOUR CONTEXT IS BOUNDED — this is a cost control, not a suggestion. Read:
+              · .flow-review/diff.patch  — the full PR diff
+              · .flow-review/files.txt   — the files it changes
+              · .flow-review/task.md     — THE TASK, and its acceptance criteria. The gate has
+                already resolved it in code from the branch (flow/<id>-…) or, when the platform
+                forced a non-flow/ branch, the PR title prefix ([<id>] …). Read the criteria from
+                here; do not go hunting for the file in .flow/tasks/ yourself.
+              · .flow/config.yml for this project's commands
+              · the specific test files the diff adds or changes
+            Do NOT read the repository at large.
+            If the diff carries the DIFF TRUNCATED marker, do NOT return a PASS verdict: name
+            the truncation in your verdict and in its summary, because passing a partial read
+            certifies what you could not read.
+
+            .flow-review/task.md may instead begin with one of two sentinels that mean this PR
+            has NO TASK BY DESIGN. Both are decided in code — branch prefix AND every changed
+            path inside a closed list — so neither is a branch-name exemption, and neither is a
+            judgement call for you:
+              · "RELEASE PR" — release files only. The sentinel carries release-guard's verdict
+                over this tree. If it reports no problems, PASS with exactly: release PR: release
+                files only, release-guard clean. If it reports problems, FAIL and name them.
+              · "SYNC PR" — the flow-sync surface only. The classification proves where the files
+                are, not where their content came from, so still read the diff. If it adds or
+                widens a `permissions:` block, introduces `pull_request_target`, points a `uses:`
+                at a different owner or an unpinned branch, or changes how a secret is read or
+                passed, FAIL and name it. Otherwise PASS with exactly: sync PR: synced surface
+                only; flow-tooling validates it.
+            Under either sentinel there are no acceptance criteria to map, and a missing task is
+            not a finding. Do not go looking for one.
+
+            Your verdict turns on ONE thing above all: does every acceptance criterion in the
+            task have a test that proves its OUTCOME? Coverage is a backstop — a green coverage
+            number with an unproven criterion is still a FAIL. For each criterion, name the
+            test (file::name) that exercises it, and check the test asserts the criterion's
+            outcome rather than merely that the code runs without throwing. A test that calls a
+            function and asserts nothing meaningful does not prove anything.
+
+            .flow-review/task.md begins with one of two sentinels when it carries no task, and
+            they ask you for OPPOSITE things — read which one it is before reacting:
+              · "NO TASK FILE RESOLVED" — the sources were checked and carry no task. Say so
+                plainly; there are no criteria to map, so do not report a criterion→test table
+                you were not in a position to build.
+              · "TASK CONTEXT UNAVAILABLE" — the sources were never supplied to the gate, so
+                nothing has been checked. Do NOT report a missing task. Locate it yourself from
+                the branch or the PR title; if you cannot, say the task CONTEXT was unavailable
+                and name that sentinel, which is what tells a human to run flow-sync.
+            The file itself states which case applies and why.
+
+            THEN DO BOTH OF THESE:
+            1. Post ONE pull-request comment: the verdict, the criterion→test table, and for a
+               FAIL the smallest set of concrete things needed to pass. No boilerplate praise.
+            2. Write .flow-review/qa.json — this is what blocks or clears the check:
+               {"verdict":"PASS"|"FAIL",
+                "unproven":["<the criterion text, verbatim, for each with no proving test>"],
+                "summary":"<one line>"}
+               `unproven` must quote the criterion so the worker knows which one to fix.
+
+            You review only. Never push commits, never edit source files, never change labels or
+            task state. The only file you write is .flow-review/qa.json.
+      - name: Enforce the qa verdict
+        if: always()
+        # flow-0103: the plan's truncation fact, from the plan job's output. Through `env:` rather
+        # than `${{ }}` in the script, the same rule the PR title and `security_reason` follow —
+        # cheaper to keep than to re-argue per value. The flag is REQUIRED by the helper, so an
+        # empty value here fails the check rather than passing a partly-read diff.
+        env:
+          DIFF_TRUNCATED: ${{ needs.plan.outputs.diff_truncated }}
+          DIFF_BYTES: ${{ needs.plan.outputs.diff_bytes }}
+          DIFF_FULL_BYTES: ${{ needs.plan.outputs.diff_full_bytes }}
+        run: >-
+          node "$FLOW_REVIEW_DIR"/flow-review.mjs verdict .flow-review/qa.json --check qa
+          --diff-truncated "$DIFF_TRUNCATED"
+          --diff-bytes "$DIFF_BYTES" --diff-full-bytes "$DIFF_FULL_BYTES"
+
+  # ── code-review ────────────────────────────────────────────────────────────────────────
+  code-review:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Materialise the review gate from the BASE branch
+        # flow-0079. Everything that DECIDES comes from base; everything that is DECIDED ABOUT
+        # comes from the PR. The env vars written below are what keeps those two apart —
+        # `FLOW_REVIEW_DIR` + `FLOW_CONFIG` + `REVIEW_TASKS_DIR` (the task file and its acceptance
+        # criteria, flow-0085) point at base, `REVIEW_REPO_DIR` / `REVIEW_OUT_DIR` point back at
+        # the PR checkout. `REVIEW_REPO_DIR` is load-bearing for
+        # a repo whose `.flow/bin/flow-review.mjs` is an ADAPTER (canonical's is): an adapter pins
+        # its git to its own realpath, which inside the base worktree would diff base against
+        # itself and hand the reviewers an empty patch.
+        #
+        # The branch name reaches the shell through `env:`, not `${{ }}` — same rule as the PR
+        # title and `security_reason`. A ref name is less attacker-chosen than a title, but the
+        # rule is cheaper to keep than to reason about case by case.
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -eu
+          git fetch -q origin "$BASE_BRANCH"
+          base_dir="$RUNNER_TEMP/flow-review-base"
+          rm -rf "$base_dir"
+          git worktree prune
+          if git cat-file -e "origin/$BASE_BRANCH:.flow/bin/flow-review.mjs" 2>/dev/null \
+             && git cat-file -e "origin/$BASE_BRANCH:.flow/config.yml" 2>/dev/null; then
+            git worktree add -q --detach "$base_dir" "origin/$BASE_BRANCH"
+            {
+              echo "FLOW_REVIEW_DIR=$base_dir/.flow/bin"
+              echo "FLOW_CONFIG=$base_dir/.flow/config.yml"
+              # flow-0085: the task file is the STANDARD the PR is judged against, so it comes
+              # from base too. A PR that edits its own acceptance criteria must not hand the
+              # reviewers the edited copy.
+              echo "REVIEW_TASKS_DIR=$base_dir/.flow/tasks"
+            } >> "$GITHUB_ENV"
+          elif [ -f .flow/bin/flow-review.mjs ]; then
+            # BOOTSTRAP — this PR is the one adopting the gate. The helper below forces the
+            # security review on (REVIEW_BOOTSTRAP) and repeats this warning in the plan summary.
+            {
+              echo "FLOW_REVIEW_DIR=$GITHUB_WORKSPACE/.flow/bin"
+              echo "REVIEW_BOOTSTRAP=1"
+              # No independent copy exists on base, so the task file can only come from the PR.
+              echo "REVIEW_TASKS_DIR=$GITHUB_WORKSPACE/.flow/tasks"
+            } >> "$GITHUB_ENV"
+            echo "::warning::BOOTSTRAP: the base branch carries no review gate, so this PR's own" \
+                 "copy is planning the review of this PR. The security review is forced on."
+            printf '### Flow review gate — :warning: BOOTSTRAP\n\n%s\n\n' \
+              'The base branch carries no `.flow/bin/flow-review.mjs` and/or no `.flow/config.yml`, so the gate was planned from THIS PR rather than from an independent copy. The security review is forced on. Expected exactly once, on the PR that adopts the review gate.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Neither base nor this PR has the helper: an adopting repo that bumped the workflow
+            # tag but has not run flow-sync. Say so, instead of failing on "node: not found".
+            echo "::error::.flow/bin/flow-review.mjs is missing from this PR and from the base" \
+                 "branch. This repo adopted a newer _flow-review.yml than its .flow/bin/ — run" \
+                 "the flow-sync workflow to adopt the helper, then re-run these checks."
+            exit 1
+          fi
+          {
+            echo "REVIEW_REPO_DIR=$GITHUB_WORKSPACE"
+            echo "REVIEW_OUT_DIR=$GITHUB_WORKSPACE/.flow-review"
+          } >> "$GITHUB_ENV"
+      - name: Bounded context — the diff and the files it changes
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          # CAN-52: the task id has two sources and the helper resolves both in code. The branch
+          # arrives as `github.head_ref` — the underscore form, deliberately. The dotted
+          # `pull_request` spelling of the same value is forbidden ANYWHERE in this file by
+          # `flow-review-workflow.test.mjs`, so that a real branch fence cannot be smuggled in
+          # behind an id lookup; that test refuses prose too, which is why this comment does not
+          # spell it either. A branch NAME here is an id source, never a gate. The PR title is
+          # attacker-controlled text: it travels through `env`, where it is data, and is never
+          # interpolated into the shell.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node "$FLOW_REVIEW_DIR"/flow-review.mjs plan
+      - uses: anthropics/claude-code-action@5ccc3a35a6367cdb8e6fbd0728287467540ecfe2 # v1.0.219
+        continue-on-error: true
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: "*"
+          claude_args: "--max-turns 60 --model ${{ needs.plan.outputs.model }} --permission-mode bypassPermissions"
+          prompt: |
+            You are the code-quality gate for this pull request. You did not write this code and
+            owe it nothing. Separate findings into blocking (must fix) and non-blocking.
+
+            YOUR CONTEXT IS BOUNDED — read .flow-review/diff.patch, .flow-review/files.txt,
+            .flow-review/task.md (the task itself, resolved for you in code from the branch
+            (flow/<id>-…) or the PR title prefix ([<id>] …)), and the specific files the diff
+            touches. Do NOT read the repository at large. If task.md begins "NO TASK FILE
+            RESOLVED" there is no declared scope to judge creep against — say so. If it begins
+            "TASK CONTEXT UNAVAILABLE" the scope was never handed to you rather than being
+            absent: say that instead, and do not report a missing task.
+
+            If the diff carries the DIFF TRUNCATED marker, do NOT return a PASS verdict: name
+            the truncation in your verdict and in its summary, because passing a partial read
+            certifies what you could not read.
+
+            .flow-review/task.md may instead begin with one of two sentinels that mean this PR
+            has NO TASK BY DESIGN. Both are decided in code — branch prefix AND every changed
+            path inside a closed list — so neither is a branch-name exemption, and neither is a
+            judgement call for you:
+              · "RELEASE PR" — release files only. The sentinel carries release-guard's verdict
+                over this tree. If it reports no problems, PASS with exactly: release PR: release
+                files only, release-guard clean. If it reports problems, FAIL and name them.
+              · "SYNC PR" — the flow-sync surface only. The classification proves where the files
+                are, not where their content came from, so still read the diff. If it adds or
+                widens a `permissions:` block, introduces `pull_request_target`, points a `uses:`
+                at a different owner or an unpinned branch, or changes how a secret is read or
+                passed, FAIL and name it. Otherwise PASS with exactly: sync PR: synced surface
+                only; flow-tooling validates it.
+            Under either sentinel there are no acceptance criteria to map, and a missing task is
+            not a finding. Do not go looking for one.
+
+            Review for:
+            1. Correctness — does it satisfy each acceptance criterion? Logic errors, off-by-one,
+               wrong conditionals, mishandled async, race conditions.
+            2. Scope — does the diff do EXACTLY what the task specified? Flag scope creep
+               (unasked-for changes) and scope gaps (criteria not met). Creep is blocking even
+               when the extra code is nice; it belongs in its own task.
+            3. Edge cases and errors — empty/null/boundary inputs, failure paths, error handling
+               and messaging. Are failures surfaced, not swallowed?
+            4. Maintainability — naming, dead code, duplication, needless complexity, leaked
+               abstractions. Would the next person understand this in six months?
+            5. Consistency — follows the patterns already in this codebase, not a new dialect.
+
+            THEN DO BOTH OF THESE:
+            1. Post ONE pull-request comment: verdict, blocking findings (file:line · what is
+               wrong · the fix), then non-blocking notes. If it passes, one line on what the
+               change does well — calibration matters, do not only ever criticise.
+            2. Write .flow-review/code-review.json:
+               {"verdict":"PASS"|"FAIL",
+                "blocking":[{"file":"…","line":0,"issue":"…","fix":"…"}],
+                "summary":"<one line>"}
+               Non-blocking notes belong in the comment, not in `blocking`.
+
+            You review only. Never push commits, never edit source files, never change labels or
+            task state. The only file you write is .flow-review/code-review.json.
+      - name: Enforce the code-review verdict
+        if: always()
+        # flow-0103: the plan's truncation fact, from the plan job's output. Through `env:` rather
+        # than `${{ }}` in the script, the same rule the PR title and `security_reason` follow —
+        # cheaper to keep than to re-argue per value. The flag is REQUIRED by the helper, so an
+        # empty value here fails the check rather than passing a partly-read diff.
+        env:
+          DIFF_TRUNCATED: ${{ needs.plan.outputs.diff_truncated }}
+          DIFF_BYTES: ${{ needs.plan.outputs.diff_bytes }}
+          DIFF_FULL_BYTES: ${{ needs.plan.outputs.diff_full_bytes }}
+        run: >-
+          node "$FLOW_REVIEW_DIR"/flow-review.mjs verdict .flow-review/code-review.json --check code-review
+          --diff-truncated "$DIFF_TRUNCATED"
+          --diff-bytes "$DIFF_BYTES" --diff-full-bytes "$DIFF_FULL_BYTES"
+
+  # ── security ───────────────────────────────────────────────────────────────────────────
+  # CONDITIONAL, and the condition comes from the repo's `review.security_paths`. This job
+  # always RUNS so the check is always present on the PR: when the diff touches none of the
+  # configured trigger paths it reports the skip and why. A skip that leaves no trace is
+  # indistinguishable from a gate that broke.
+  security:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Security review applicability
+        # `security_reason` names the changed files that did (or did not) match the trigger
+        # globs, and a PR author controls file names. Interpolating it into the shell with
+        # ${{ }} would splice attacker-chosen text into the script — the exact class
+        # .flow/config.yml calls out for these reusables. It goes through the environment,
+        # where it is data and never parsed as shell.
+        env:
+          SECURITY_RUN: ${{ needs.plan.outputs.security_run }}
+          SECURITY_REASON: ${{ needs.plan.outputs.security_reason }}
+        run: |
+          if [ "$SECURITY_RUN" = "true" ]; then verdict="RUNNING"; else verdict="SKIPPED"; fi
+          {
+            printf '### Security review — %s\n\n' "$verdict"
+            printf '%s\n' "$SECURITY_REASON"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: ${{ needs.plan.outputs.security_run == 'true' }}
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: ${{ needs.plan.outputs.security_run == 'true' }}
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Materialise the review gate from the BASE branch
+        if: ${{ needs.plan.outputs.security_run == 'true' }}
+        # flow-0079. Everything that DECIDES comes from base; everything that is DECIDED ABOUT
+        # comes from the PR. The env vars written below are what keeps those two apart —
+        # `FLOW_REVIEW_DIR` + `FLOW_CONFIG` + `REVIEW_TASKS_DIR` (the task file and its acceptance
+        # criteria, flow-0085) point at base, `REVIEW_REPO_DIR` / `REVIEW_OUT_DIR` point back at
+        # the PR checkout. `REVIEW_REPO_DIR` is load-bearing for
+        # a repo whose `.flow/bin/flow-review.mjs` is an ADAPTER (canonical's is): an adapter pins
+        # its git to its own realpath, which inside the base worktree would diff base against
+        # itself and hand the reviewers an empty patch.
+        #
+        # The branch name reaches the shell through `env:`, not `${{ }}` — same rule as the PR
+        # title and `security_reason`. A ref name is less attacker-chosen than a title, but the
+        # rule is cheaper to keep than to reason about case by case.
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -eu
+          git fetch -q origin "$BASE_BRANCH"
+          base_dir="$RUNNER_TEMP/flow-review-base"
+          rm -rf "$base_dir"
+          git worktree prune
+          if git cat-file -e "origin/$BASE_BRANCH:.flow/bin/flow-review.mjs" 2>/dev/null \
+             && git cat-file -e "origin/$BASE_BRANCH:.flow/config.yml" 2>/dev/null; then
+            git worktree add -q --detach "$base_dir" "origin/$BASE_BRANCH"
+            {
+              echo "FLOW_REVIEW_DIR=$base_dir/.flow/bin"
+              echo "FLOW_CONFIG=$base_dir/.flow/config.yml"
+              # flow-0085: the task file is the STANDARD the PR is judged against, so it comes
+              # from base too. A PR that edits its own acceptance criteria must not hand the
+              # reviewers the edited copy.
+              echo "REVIEW_TASKS_DIR=$base_dir/.flow/tasks"
+            } >> "$GITHUB_ENV"
+          elif [ -f .flow/bin/flow-review.mjs ]; then
+            # BOOTSTRAP — this PR is the one adopting the gate. The helper below forces the
+            # security review on (REVIEW_BOOTSTRAP) and repeats this warning in the plan summary.
+            {
+              echo "FLOW_REVIEW_DIR=$GITHUB_WORKSPACE/.flow/bin"
+              echo "REVIEW_BOOTSTRAP=1"
+              # No independent copy exists on base, so the task file can only come from the PR.
+              echo "REVIEW_TASKS_DIR=$GITHUB_WORKSPACE/.flow/tasks"
+            } >> "$GITHUB_ENV"
+            echo "::warning::BOOTSTRAP: the base branch carries no review gate, so this PR's own" \
+                 "copy is planning the review of this PR. The security review is forced on."
+            printf '### Flow review gate — :warning: BOOTSTRAP\n\n%s\n\n' \
+              'The base branch carries no `.flow/bin/flow-review.mjs` and/or no `.flow/config.yml`, so the gate was planned from THIS PR rather than from an independent copy. The security review is forced on. Expected exactly once, on the PR that adopts the review gate.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Neither base nor this PR has the helper: an adopting repo that bumped the workflow
+            # tag but has not run flow-sync. Say so, instead of failing on "node: not found".
+            echo "::error::.flow/bin/flow-review.mjs is missing from this PR and from the base" \
+                 "branch. This repo adopted a newer _flow-review.yml than its .flow/bin/ — run" \
+                 "the flow-sync workflow to adopt the helper, then re-run these checks."
+            exit 1
+          fi
+          {
+            echo "REVIEW_REPO_DIR=$GITHUB_WORKSPACE"
+            echo "REVIEW_OUT_DIR=$GITHUB_WORKSPACE/.flow-review"
+          } >> "$GITHUB_ENV"
+      - name: Bounded context — the diff and the files it changes
+        if: ${{ needs.plan.outputs.security_run == 'true' }}
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          # CAN-52: the task id has two sources and the helper resolves both in code. The branch
+          # arrives as `github.head_ref` — the underscore form, deliberately. The dotted
+          # `pull_request` spelling of the same value is forbidden ANYWHERE in this file by
+          # `flow-review-workflow.test.mjs`, so that a real branch fence cannot be smuggled in
+          # behind an id lookup; that test refuses prose too, which is why this comment does not
+          # spell it either. A branch NAME here is an id source, never a gate. The PR title is
+          # attacker-controlled text: it travels through `env`, where it is data, and is never
+          # interpolated into the shell.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node "$FLOW_REVIEW_DIR"/flow-review.mjs plan
+      - uses: anthropics/claude-code-action@5ccc3a35a6367cdb8e6fbd0728287467540ecfe2 # v1.0.219
+        if: ${{ needs.plan.outputs.security_run == 'true' }}
+        continue-on-error: true
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: "*"
+          # A repo that wants a deeper model on security diffs sets review.security_model;
+          # otherwise this is review.model. Either way it comes from config, not from here.
+          claude_args: "--max-turns 60 --model ${{ needs.plan.outputs.security_model }} --permission-mode bypassPermissions"
+          prompt: |
+            You are the security gate for this pull request. Findings are rated, and the gate is
+            binary on High/Critical.
+
+            YOUR CONTEXT IS BOUNDED — review the DIFF and its immediate blast radius, not the
+            whole repo. Read .flow-review/diff.patch, .flow-review/files.txt, .flow-review/task.md
+            (the task, resolved in code from the branch or the PR title — it tells you what the
+            change was meant to do; if it begins "NO TASK FILE RESOLVED" or "TASK CONTEXT
+            UNAVAILABLE" you simply have less intent context, and reporting either is the qa
+            gate's job, not yours), the `security`
+            block of .flow/config.yml (`secrets_scan`,
+            `dependency_audit`, `focus[]`), and the specific files the diff touches. Do NOT read
+            the repository at large.
+
+            If the diff carries the DIFF TRUNCATED marker, do NOT return a PASS verdict: name
+            the truncation in your verdict and in its summary, because passing a partial read
+            certifies what you could not read.
+
+            .flow-review/task.md may instead begin with one of two sentinels that mean this PR
+            has NO TASK BY DESIGN. Both are decided in code — branch prefix AND every changed
+            path inside a closed list — so neither is a branch-name exemption, and neither is a
+            judgement call for you:
+              · "RELEASE PR" — release files only. The sentinel carries release-guard's verdict
+                over this tree. If it reports no problems, PASS with exactly: release PR: release
+                files only, release-guard clean. If it reports problems, FAIL and name them.
+              · "SYNC PR" — the flow-sync surface only. The classification proves where the files
+                are, not where their content came from, so still read the diff. If it adds or
+                widens a `permissions:` block, introduces `pull_request_target`, points a `uses:`
+                at a different owner or an unpinned branch, or changes how a secret is read or
+                passed, FAIL and name it. Otherwise PASS with exactly: sync PR: synced surface
+                only; flow-tooling validates it.
+            Under either sentinel there are no acceptance criteria to map, and a missing task is
+            not a finding. Do not go looking for one.
+
+            Always check:
+            1. Secrets — no keys, tokens, passwords, connection strings or private certs in the
+               diff, including in tests and fixtures.
+            2. Dependencies — new dependencies are real, maintained, and not typosquats; run the
+               stack's audit command if one is configured.
+            3. Authn/authz — any new endpoint, query or action: is it access-controlled? Can a
+               user reach data that is not theirs? Watch for MISSING checks, not just wrong ones.
+            4. Input validation — every external entry point (request bodies, params, uploads,
+               webhook payloads, env) validated and bounded before use. Watch injection.
+            5. Secret storage — read from env/vault, never hard-coded, never logged, never
+               echoed in an error.
+
+            Then do a targeted pass for each item in config.yml → `security.focus`. Those are
+            listed because they have mattered in this repo before; treat them as first-class.
+
+            THEN DO BOTH OF THESE:
+            1. Post ONE pull-request comment: verdict, then a findings table — severity
+               (Critical/High/Medium/Low) · file:line · issue · fix. For each High/Critical give
+               the concrete remediation, not "consider reviewing".
+            2. Write .flow-review/security.json:
+               {"verdict":"PASS"|"FAIL",
+                "blocking":[{"file":"…","line":0,"issue":"…","fix":"…"}],
+                "summary":"<one line>"}
+               FAIL iff there is a High or Critical finding, and `blocking` holds exactly those;
+               a truncated diff is its own FAIL, per the bounded-context rule above.
+               Medium/Low go in the comment; they do not block.
+
+            You review only. Never push commits, never edit source files, never change labels or
+            task state. The only file you write is .flow-review/security.json.
+      - name: Enforce the security verdict
+        if: ${{ always() && needs.plan.outputs.security_run == 'true' }}
+        # flow-0103: the plan's truncation fact, from the plan job's output. Through `env:` rather
+        # than `${{ }}` in the script, the same rule the PR title and `security_reason` follow —
+        # cheaper to keep than to re-argue per value. The flag is REQUIRED by the helper, so an
+        # empty value here fails the check rather than passing a partly-read diff.
+        env:
+          DIFF_TRUNCATED: ${{ needs.plan.outputs.diff_truncated }}
+          DIFF_BYTES: ${{ needs.plan.outputs.diff_bytes }}
+          DIFF_FULL_BYTES: ${{ needs.plan.outputs.diff_full_bytes }}
+        run: >-
+          node "$FLOW_REVIEW_DIR"/flow-review.mjs verdict .flow-review/security.json --check security
+          --diff-truncated "$DIFF_TRUNCATED"
+          --diff-bytes "$DIFF_BYTES" --diff-full-bytes "$DIFF_FULL_BYTES"
+
+  # ── guide ──────────────────────────────────────────────────────────────────────────────
+  # ONE comment that tells the human where to look (flow-0084). It runs AFTER the three checks,
+  # whatever each of them concluded, and it is the only job here that never blocks anything.
+  #
+  # WHY A FOURTH JOB AND NOT A BETTER PR DESCRIPTION. The PR description is written by the context
+  # that produced the work, which is the wrong author for "here is what to check" — it steers away
+  # from its own weak spots without meaning to. The three reviewers already run outside that
+  # session, but three comments plus a long description is not a touchpoint, it is reading. This
+  # job combines their results with facts computed from the diff into one short comment, in a fixed
+  # order, that a human can act on from a phone.
+  #
+  # FACTS FROM CODE, PROSE FROM A MODEL, IN SEPARATE SECTIONS. `review-guide.mjs` computes the
+  # hotspots (a security-trigger path in the diff, a deleted or weakened test, a file outside the
+  # task's `touches`), quotes the PR description's `## Assumptions` verbatim, and renders the
+  # verdicts row. The model writes the TL;DR and the smoke test, and may REORDER the hotspots by
+  # naming their ids — it cannot add, drop or reword one, because every fact's text is produced by
+  # the helper and the model only ever returns ids. If the model call fails the comment still
+  # posts, with a line saying the summary is unavailable: fail-open for prose, never for facts.
+  #
+  # IT NEVER BLOCKS, AND THAT IS ASSERTED RATHER THAN ASSUMED. `continue-on-error: true` sits on
+  # the JOB, so a broken guide cannot fail the workflow run, and no other job declares
+  # `needs: guide`, so it cannot hold one up either. An advisory comment that could turn a PR red
+  # is the thing this must never become.
+  #
+  # THE DRAFT AND FORK FENCES ARE INHERITED, NOT RECOPIED. `needs.plan.result == 'success'` is the
+  # whole gate: `plan` carries the opt-in, the draft clause and the head-repo comparison, so a
+  # draft or a fork PR skips it and this job's `if` is false. `always()` is what lets the guide run
+  # when a REVIEWER failed — which is exactly when a human most needs to know where to look — and
+  # the `plan` clause is what stops `always()` from also defeating those two fences.
+  guide:
+    needs: [plan, qa, code-review, security]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    # The guide is advisory. Nothing it does may turn this PR red.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Materialise the review gate from the BASE branch
+        # flow-0079. Everything that DECIDES comes from base; everything that is DECIDED ABOUT
+        # comes from the PR. The env vars written below are what keeps those two apart —
+        # `FLOW_REVIEW_DIR` + `FLOW_CONFIG` + `REVIEW_TASKS_DIR` (the task file and its acceptance
+        # criteria, flow-0085) point at base, `REVIEW_REPO_DIR` / `REVIEW_OUT_DIR` point back at
+        # the PR checkout. `REVIEW_REPO_DIR` is load-bearing for
+        # a repo whose `.flow/bin/flow-review.mjs` is an ADAPTER (canonical's is): an adapter pins
+        # its git to its own realpath, which inside the base worktree would diff base against
+        # itself and hand the reviewers an empty patch.
+        #
+        # The branch name reaches the shell through `env:`, not `${{ }}` — same rule as the PR
+        # title and `security_reason`. A ref name is less attacker-chosen than a title, but the
+        # rule is cheaper to keep than to reason about case by case.
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -eu
+          git fetch -q origin "$BASE_BRANCH"
+          base_dir="$RUNNER_TEMP/flow-review-base"
+          rm -rf "$base_dir"
+          git worktree prune
+          if git cat-file -e "origin/$BASE_BRANCH:.flow/bin/flow-review.mjs" 2>/dev/null \
+             && git cat-file -e "origin/$BASE_BRANCH:.flow/config.yml" 2>/dev/null; then
+            git worktree add -q --detach "$base_dir" "origin/$BASE_BRANCH"
+            {
+              echo "FLOW_REVIEW_DIR=$base_dir/.flow/bin"
+              echo "FLOW_CONFIG=$base_dir/.flow/config.yml"
+              # flow-0085: the task file is the STANDARD the PR is judged against, so it comes
+              # from base too. A PR that edits its own acceptance criteria must not hand the
+              # reviewers the edited copy.
+              echo "REVIEW_TASKS_DIR=$base_dir/.flow/tasks"
+            } >> "$GITHUB_ENV"
+          elif [ -f .flow/bin/flow-review.mjs ]; then
+            # BOOTSTRAP — this PR is the one adopting the gate. The helper below forces the
+            # security review on (REVIEW_BOOTSTRAP) and repeats this warning in the plan summary.
+            {
+              echo "FLOW_REVIEW_DIR=$GITHUB_WORKSPACE/.flow/bin"
+              echo "REVIEW_BOOTSTRAP=1"
+              # No independent copy exists on base, so the task file can only come from the PR.
+              echo "REVIEW_TASKS_DIR=$GITHUB_WORKSPACE/.flow/tasks"
+            } >> "$GITHUB_ENV"
+            echo "::warning::BOOTSTRAP: the base branch carries no review gate, so this PR's own" \
+                 "copy is planning the review of this PR. The security review is forced on."
+            printf '### Flow review gate — :warning: BOOTSTRAP\n\n%s\n\n' \
+              'The base branch carries no `.flow/bin/flow-review.mjs` and/or no `.flow/config.yml`, so the gate was planned from THIS PR rather than from an independent copy. The security review is forced on. Expected exactly once, on the PR that adopts the review gate.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Neither base nor this PR has the helper: an adopting repo that bumped the workflow
+            # tag but has not run flow-sync. Say so, instead of failing on "node: not found".
+            echo "::error::.flow/bin/flow-review.mjs is missing from this PR and from the base" \
+                 "branch. This repo adopted a newer _flow-review.yml than its .flow/bin/ — run" \
+                 "the flow-sync workflow to adopt the helper, then re-run these checks."
+            exit 1
+          fi
+          {
+            echo "REVIEW_REPO_DIR=$GITHUB_WORKSPACE"
+            echo "REVIEW_OUT_DIR=$GITHUB_WORKSPACE/.flow-review"
+          } >> "$GITHUB_ENV"
+      - name: Bounded context — the diff and the files it changes
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          # CAN-52: the task id has two sources and the helper resolves both in code. The branch
+          # arrives as `github.head_ref` — the underscore form, deliberately. The dotted
+          # `pull_request` spelling of the same value is forbidden ANYWHERE in this file by
+          # `flow-review-workflow.test.mjs`, so that a real branch fence cannot be smuggled in
+          # behind an id lookup; that test refuses prose too, which is why this comment does not
+          # spell it either. A branch NAME here is an id source, never a gate. The PR title is
+          # attacker-controlled text: it travels through `env`, where it is data, and is never
+          # interpolated into the shell.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node "$FLOW_REVIEW_DIR"/flow-review.mjs plan
+      - name: Compute the guide's facts — hotspots, assumptions, no model involved
+        # The PR BODY is the third piece of attacker-chosen text this workflow handles, after the
+        # branch name and the PR title, and it is quoted into a comment and shown to a model. Same
+        # rule as the other two: it reaches the helper through `env`, where it is data, and is
+        # never interpolated into the shell. The helper fences it inside the model's brief.
+        #
+        # `security_paths` is read from BASE's config.yml via $FLOW_CONFIG, for the same reason the
+        # security decision is: the guide's hotspots must agree with the check the human is reading
+        # the verdict of, and a PR must not be able to delete the glob that names its own hotspot.
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          TASK_ID: ${{ needs.plan.outputs.task_id }}
+        run: node "$FLOW_REVIEW_DIR"/review-guide.mjs facts
+      - uses: anthropics/claude-code-action@5ccc3a35a6367cdb8e6fbd0728287467540ecfe2 # v1.0.219
+        continue-on-error: true          # prose is fail-open; the comment posts without it
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: "*"
+          # The model comes from the repo's .flow/config.yml, like every other call here. The turn
+          # budget is the effort bound: this reads ONE file and writes ONE small JSON object, so a
+          # run that needs more turns than this has misunderstood the job.
+          claude_args: "--max-turns 6 --model ${{ needs.plan.outputs.model }} --permission-mode bypassPermissions"
+          prompt: |
+            You write the two prose lines of this pull request's review guide. You are not a
+            reviewer: three reviewers have already run and their verdicts are not yours to revisit.
+
+            YOUR CONTEXT IS ONE FILE. Read .flow-review/guide-facts.md and nothing else. Do not
+            read the diff, the task, or the repository. Everything you are allowed to talk about is
+            in that file, which lists the computed hotspots and their ids.
+
+            THE FACTS ARE NOT YOURS TO EDIT. They are computed in code and rendered in code. You do
+            not restate them, summarise them, reword them, add one, or leave one out. The only
+            thing you may say about them is which of them a human should look at FIRST, and you say
+            that by naming their ids.
+
+            Write .flow-review/guide-prose.json and nothing else:
+              {"tldr":"<one line: what this PR changes, in plain English, for someone who has not
+                        read it. No praise, no verdict, no hedging.>",
+               "look_here":["<hotspot id>", "…"],
+               "smoke_test":"<one concrete thing to try by hand to see this working, or to see it
+                             broken. A command or a two-step click-path, not 'test thoroughly'.>"}
+
+            `look_here` holds ids copied EXACTLY from guide-facts.md, most important first. Name
+            only ids that appear there; an id you invent is discarded. Naming none is fine — the
+            computed order is then used — and so is naming all of them. You are choosing an order,
+            not a subset: nothing you leave out is removed from the comment.
+
+            If guide-facts.md lists no hotspots, return an empty `look_here` and still write the
+            TL;DR and the smoke test.
+
+            Do NOT post a pull-request comment. The workflow posts one comment and updates it in
+            place; a second comment from you is the noise this whole job exists to remove. Never
+            push commits, never edit source files, never change labels or task state. The only file
+            you write is .flow-review/guide-prose.json.
+      - name: Render the guide comment — facts and verdicts, with or without the prose
+        # always(), because the model step is `continue-on-error` and this is the step that makes
+        # the fail-open real: the three verdicts and every computed fact render whether or not the
+        # prose arrived.
+        #
+        # The three results come from the JOBS, not from each reviewer's verdict file: those are
+        # written into each job's own workspace and nothing downstream can read them. SECURITY_RUN
+        # is what keeps the row honest — the security job always runs so the check is never
+        # silently absent, so a skipped REVIEW still reports a successful JOB, and rendering that
+        # as "pass" is the one wrong answer this row can give.
+        if: always()
+        env:
+          QA_RESULT: ${{ needs.qa.result }}
+          CODE_REVIEW_RESULT: ${{ needs['code-review'].result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          SECURITY_RUN: ${{ needs.plan.outputs.security_run }}
+          SECURITY_REASON: ${{ needs.plan.outputs.security_reason }}
+        run: node "$FLOW_REVIEW_DIR"/review-guide.mjs comment
+      - name: Post or update the ONE guide comment
+        # One comment per PR, found by the hidden marker in its body and updated in place. The
+        # review workflow runs again on every hand-off, and a guide that appended would bury the
+        # reviewers' own comments under its own history — the opposite of the problem it solves.
+        #
+        # The marker lookup is the helper's, not a `--jq` expression here: it is a decision, it has
+        # a proving test, and a shell one-liner in a reusable workflow is the one piece of this
+        # gate nobody can test. `--slurp` merges the pages; the helper flattens either shape, so a
+        # gh version that nests them cannot cause a duplicate comment.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          body="$GITHUB_WORKSPACE/.flow-review/guide-comment.md"
+          if [ ! -f "$body" ]; then
+            echo "::warning::review-guide: no comment body was rendered, so there is nothing to post."
+            exit 0
+          fi
+          comments="$RUNNER_TEMP/guide-comments.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" > "$comments"
+          id="$(node "$FLOW_REVIEW_DIR"/review-guide.mjs comment-id "$comments")"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$body" --jq .html_url
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$body" --jq .html_url
+          fi

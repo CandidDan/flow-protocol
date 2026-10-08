@@ -1,0 +1,28 @@
+name: flow-gates
+
+# Thin caller — the gate logic lives in canonical (CandidDan/flow) as a reusable workflow,
+# adopted here by reference instead of copied. Pinned to a tag for stability; bump the tag to
+# adopt a new Flow version (the flow-doctor drift check warns when this repo falls behind).
+# See docs/flow-reusable-workflows.md in the flow repo.
+
+on:
+  pull_request:
+    # `ready_for_review` because the reusable skips drafts: the event that matters is the PR
+    # leaving draft, and it is not one of the default types (flow-0136).
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to a PR cancels the run it supersedes (flow-0136). Pull requests only: a manual run
+# (`workflow_dispatch`) is never cancelled.
+concurrency:
+  group: flow-gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  flow-gates:
+    uses: CandidDan/flow/.github/workflows/_flow-gates.yml@v3
+    # Node 22 is the default. Non-Node stack? Pass setup_node_version: "" and provision the
+    # toolchain inside the .flow/config.yml commands:
+    # with:
+    #   setup_node_version: ""
