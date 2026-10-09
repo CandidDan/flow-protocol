@@ -1,0 +1,227 @@
+# .flow/config.yml
+# The ONLY file that changes per stack. The protocol in CLAUDE.md is identical
+# across every project; it refers to the command names below. Fill these in when
+# you scaffold a new project from the template, and the gates work everywhere.
+
+project:
+  name: "REPLACE-ME"            # short slug, also used as the task-id prefix
+  language: "REPLACE-ME"        # e.g. typescript, python, swift, go, ruby
+  description: "REPLACE-ME"
+
+# Commands. Each must exit non-zero on failure so CI and the qa review check can trust them.
+# Examples are illustrative — set the real ones for this repo.
+#
+# COVER EVERY SOURCE TREE. The gate only validates what these commands actually reach. If the
+# repo has more than one runtime or source root — e.g. a Node app AND Deno/edge functions, a
+# frontend AND a separate worker, infra/ alongside src/ — make sure build/lint (and a parse/
+# type-check) touch ALL of them, not just the primary app. A tree no command parses is never
+# checked until production. (Real incident: edge functions were Deno-only, the gate ran only in
+# app/, and a parse error that the runtime upgrade exposed took down inbound for ~7 days. Add a
+# per-tree check, e.g. `deno check supabase/functions/**/*.ts`.) When in doubt, list your source
+# roots and confirm each is parsed by some command here.
+#
+# NOTE for lockfile stacks: if `install` is strict (`npm ci`, `pnpm i --frozen-lockfile`,
+# `poetry install --sync`), run it once locally after adding any dependency and commit the
+# resynced lockfile. A lock that's only half-updated passes a lenient local install but fails
+# the gate's strict install — exactly how a drifted lock hides until the first PR.
+commands:
+  install: "REPLACE-ME"         # e.g. "npm ci"            | "uv sync"          | "bundle install"
+  build:   "REPLACE-ME"         # e.g. "npm run build"     | "python -m build"  | "swift build"
+  lint:    "REPLACE-ME"         # e.g. "npm run lint"      | "ruff check ."     | "swiftlint"
+  test:    "REPLACE-ME"         # e.g. "npm test"          | "pytest"           | "swift test"
+  coverage: "REPLACE-ME"        # command that prints a coverage % and exits non-zero under threshold
+                                # e.g. "npm run coverage" | "pytest --cov --cov-fail-under=80"
+
+# The coverage FLOOR — a backstop, not the real gate. It's a blunt, game-able signal
+# (lines executed, not behaviour proven), so the actual correctness check is the
+# qa check's criterion->test mapping; this just stops coverage quietly collapsing.
+# The gate fails if coverage drops below this, regardless of stack. Pick a real number;
+# raise it over time, never lower it silently. Sitting exactly at the floor proves nothing.
+coverage_min: 80
+
+# The CLAUDE.md ceiling, in BYTES — and what it measures is the point of it. `CLAUDE.md` auto-loads
+# into EVERY session in this repo, so every byte of it is always-on context. The ceiling applies to
+# the RESOLVED IMPORT SET: `CLAUDE.md` plus every file Claude Code loads from it by `@`-import
+# (transitively, to its limit of 5 hops), each unique file counted once. `wc -c CLAUDE.md` is NOT
+# the measurement and never was — this repo's own `CLAUDE.md` is 2.3k characters and imports the
+# 24.6k-character `.flow/PROTOCOL.md`, so byte-counting the one file would report a tenth of what a
+# session loads, and moving prose behind an import would read as an improvement.
+#
+# `.flow/bin/check-claude-md.mjs` enforces it in the gate: over the ceiling fails, with a per-file
+# breakdown largest-first naming what to cut. Removing this key does not switch the check off — it
+# reports the total and warns that nothing is enforcing it.
+#
+# The cost being bounded is ADHERENCE, not window space. A 1M-token window is not running out; what
+# degrades is that every rule in an always-on block competes with every other rule, and that does
+# not improve as windows grow.
+#
+# The default below is the protocol (~24.6k) plus a ~25k allowance for this project's own notes.
+# CALIBRATE IT: measure yours with `node .flow/bin/check-claude-md.mjs` and set the number from what
+# you measure, with stated headroom — the same way `coverage_min` is set. Never raise it to go green.
+claude_md_max: 50000
+
+# OPTIONAL — the queue cap: a WIP limit on what gets PLANNED, not on what gets worked.
+#
+# Uncomment it and at most that many tasks may be `ready` at once: `allocate-task-id` refuses a
+# new `ready` task while that many already are, before it writes, commits or pushes anything.
+# Flow already caps work in progress (one claim per session, `touches` overlap) and caps planning
+# nowhere, so an orchestrator can write `ready` tasks faster than any worker drains them.
+#
+# The number is a MAXIMUM — `queue_cap: 8` means at most 8 ready, so the 9th is refused. The only
+# bypass is the draft's own `urgent` label, which is the HUMAN's to apply (the same rule as
+# `auto-ok`): there is no flag and no env var, because a bypass a session can hand itself is not
+# a limit. A `blocked` draft is never capped — the cap limits the ready queue, not the store.
+#
+# Commented out, and that is the default: with no `queue_cap`, nothing is capped.
+# queue_cap: 8
+
+# Source roots — the gate-coverage floor. Declare every tree that holds source AND the command
+# that parses/lints it. flow-doctor enforces this on every PR: a declared root that's missing or
+# has no check FAILS, and any top-level source tree NOT covered here FAILS too — so a new runtime
+# added six months from now (a worker, edge functions, a second language) can't slip in ungated
+# the way it silently could before. Calibrate at scaffold (list what's actually in the repo);
+# it ratchets like coverage_min — widen it as the repo grows, the drift check keeps it honest.
+# Single-stack repos just declare one root. If a tree genuinely shouldn't be gated, name it in
+# `source_roots_ignore:` below rather than leaving it silently uncovered.
+#
+# Since Flow 2.x the gate also RUNS these checks. `_flow-gates.yml` plans a job per entry whose
+# `check` is not already one of the four `commands.*` above — those the `gate` job runs anyway, so
+# re-running them would only burn CI minutes. A single-stack repo whose one root is `npm run lint`
+# therefore plans nothing and sees a skipped job, which is correct. Adding a gated tree is now an
+# edit to THIS FILE, which a worker can push; it no longer means editing `.github/workflows/`,
+# which needs a Workflows: Write credential most workers do not have.
+#
+# Three OPTIONAL per-entry fields, each with a default, all ignored by flow-doctor:
+#   runtime:  node (default) | deno | none.  `none` runs no setup step — use it when the check
+#             provisions its own toolchain (a `uv sync`, a container, a `bundle install`).
+#   version:  the runtime version to install. Defaults to "22" for node and "v2.x" for deno;
+#             ignored entirely for `none`.
+#   retry:    0 (default) to 3. The check is attempted `1 + retry` times and the log names the
+#             attempt that succeeded. It is for a genuinely flaky EXTERNAL dependency (a remote
+#             module loader, a package registry) — the cap is deliberate, so a check that is
+#             simply broken cannot pass as merely flaky.
+# Any other field is a hard error naming the entry and the field, rather than a silent no-op.
+# The check runs from the repo root exactly as written, the same convention `commands.*` uses, so
+# install steps belong inside it: `check: "cd mcp && npm ci && npm run build"`.
+source_roots:
+  - path: "REPLACE-ME/"         # e.g. "app/"                 → the primary app
+    check: "REPLACE-ME"         #      "npm run lint"         → a command that PARSES this tree
+  # Add one block per additional runtime/source root, e.g. for a polyglot repo:
+  # - path: "supabase/functions/"
+  #   check: "deno check supabase/functions/**/*.ts"
+  #   runtime: "deno"           # installs Deno instead of Node before running the check
+  #   retry: 1                  # one retry, for a flaky remote-module fetch
+
+# Top-level folders that hold source-extension files but are deliberately NOT gated — this repo's
+# additions to flow-doctor's built-in ignore list (build output, deps, VCS), so extending it is a
+# config edit here rather than a patch to Flow's own code that the next flow-sync overwrites.
+# Bare top-level folder names only: no "/", no globs. An ignored folder is NEVER gated, so
+# ignoring one is a decision you are recording — prefer a `source_root` with a real check, and use
+# this only where there is genuinely no check to run (prose, a scratch tree the human has ruled
+# out). A malformed entry, or one naming a folder that isn't there, is a flow-doctor warning
+# naming it and exempts nothing.
+source_roots_ignore: []         # e.g. ["docs", "holding"]
+
+# Security expectations the security review check enforces on top of its general review.
+# List anything stack- or project-specific that has bitten you before.
+security:
+  secrets_scan: true            # no credentials, tokens, keys committed
+  dependency_audit: true        # e.g. "npm audit" / "pip-audit" — wire into CI
+  focus:                        # extra scrutiny areas — tailor per project
+    - "authn/authz boundaries"
+    - "input validation on all external entry points"
+    - "secret storage (vaults/env, never source)"
+    # e.g. for a Supabase project you might add: "row-level security policies", "OAuth token handling"
+
+# The review gate — the three Definition-of-Done reviewers that run as CHECKS ON THE PR
+# (flow-review.yml), not as subagents inside the worker's session. The worker no longer
+# certifies its own work; these are the only things that do.
+#
+# Everything here is DATA. Nothing in the reusable workflow names a model or a path, so a
+# project tunes its review by editing this block rather than by patching shared infra.
+review:
+  # FULL MODEL IDS, ON PURPOSE — never an alias like `sonnet` or `opus`. An alias resolves through
+  # whatever Claude Code CLI the action pin installs, and an older CLI resolves it to an older
+  # model, silently (flow-0140). A full ID names exactly one model, so a new one is a reviewed,
+  # one-line change here. An alias still works; it just stops saying what runs.
+  #
+  # The model the qa check and the review guide run on. Criterion-to-test mapping is mostly
+  # mechanical, so Sonnet: capable enough to be hard to fool, cheap enough for every PR. Omit it
+  # and the gate falls back to a default AND says so in the run summary — an unconfigured repo
+  # should look unconfigured.
+  model: "claude-sonnet-5-5"
+
+  # Optional: the model for the code-review check only. Opus, because builds run on Sonnet and a
+  # Sonnet reviewer grading Sonnet work shares its blind spots. Omit to use `model`.
+  code_review_model: "claude-opus-5-5"
+
+  # Optional: a deeper model for the security check only, since it runs on a minority of PRs.
+  # Opus — and never Fable for security work. Omit to use `model`.
+  security_model: "claude-opus-5-5"
+
+  # Optional: how many BYTES of the PR diff the reviewers are handed. Omitted, it is 300000.
+  #
+  # Raise it if this repo legitimately opens large PRs — generated docs, fixtures, a vendored
+  # dependency bump. Past the limit the diff is cut, and all three reviewers are instructed to
+  # refuse to PASS what they could only partly read, so a repo whose normal PR exceeds it goes
+  # red on correct work with nothing to change. That is the case this key exists for.
+  #
+  # IT COSTS. Every one of the three reviewers reads the diff, on every PR, so each byte here is
+  # billed up to three times. Raise it to fit the PRs you actually open, not to the ceiling.
+  # Maximum 2000000; a value that is not a positive whole number within that bound fails the plan
+  # step with an error naming this key, rather than quietly falling back to the default.
+  #
+  # Read from the BASE branch's copy of this file, like `security_paths` below — a PR cannot raise
+  # the limit on its own diff.
+  # max_diff_bytes: 900000
+
+  # OPTIONAL — the auto-fix round (flow-0082). COMMENTED OUT, and that is the default: with no
+  # `auto_fix_rounds`, a failed review check does nothing automatic, exactly as before.
+  #
+  # Set it and a failed `qa` or `code-review` check dispatches ONE bounded auto-fix worker onto
+  # the same PR (`flow-kickback.yml`). The worker reads the reviewers' blocking findings, fixes
+  # them on the PR's own branch and COMMITS; the workflow checks the round and pushes, and the
+  # three reviewers then run again from scratch. Merge stays human, always.
+  #
+  # The number is a MAXIMUM of rounds per PR, and the HARD MAXIMUM IS 3 — a larger value is
+  # clamped to 3 with a warning on the run naming what you configured. The cap is the point: the
+  # fixer and the reviewer are both models, and more rounds between them converge on agreement,
+  # not necessarily on correctness. 2 is a sensible opt-in.
+  #
+  # IT NEEDS FLOW_PAT. A push made with GITHUB_TOKEN triggers no workflows, so a fix pushed with
+  # it would never be re-reviewed; without the secret the workflow skips and says so.
+  #
+  # WHAT IT WILL NEVER DO: auto-fix a failed SECURITY check, push a round that deleted a test or
+  # removed an assertion, or merge anything. Each of those posts one decision card on the PR and
+  # adds the `flow:needs-human` label — which is also that PR's off switch, since the workflow
+  # never acts on a labelled PR and removing the label re-arms it.
+  # auto_fix_rounds: 2
+
+  # The security review is CONDITIONAL: it runs when the diff touches one of these globs, and
+  # is skipped — visibly, with the reason on the run — when it does not. It earns its keep on
+  # auth, external input, data access and dependency diffs, and has little to chew on in a copy
+  # change; per-PR cost is what keeps the gate affordable enough to leave switched on.
+  #
+  # Same glob syntax as a task's `touches` (`**` spans directories, `*` does not).
+  #
+  # LEAVING THIS EMPTY IS NOT "off" — an unscoped repo runs the security review on EVERY PR.
+  # "Nobody scoped it yet" must never read as "nothing here needs review."
+  security_paths:                       # REPLACE-ME — the paths that warrant a security review
+    - "REPLACE-ME/auth/**"              # e.g. "src/auth/**", "app/api/**"
+    - "package.json"                    # dependency changes, whatever the lockfile stack
+    - "package-lock.json"
+
+# The intent rule's start date (ADR-0007 slice 2). Uncomment when this repo starts writing intents
+# (`.flow/intents/`, via the intent-writer skill), set to that day. From then on, a `ready` task
+# created on or after the date and serving anything other than `maintenance` should name the
+# intent it derives from in `intent:`, and flow-doctor WARNS when it doesn't. Tasks created before
+# the date are never asked for one — forward-only, no backfill, no hand-kept grandfather list.
+# While `.flow/intents/` exists and this is unset, flow-doctor reports ONE warning naming the key.
+# intents:
+#   required_from: "YYYY-MM-DD"
+
+# Branch + PR conventions (kept here so agents and CI agree).
+git:
+  base_branch: "main"
+  branch_prefix: "flow/"        # branches are flow/<task-id>-<slug>
+  protect_main: true            # never commit to base directly
